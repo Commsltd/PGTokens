@@ -2263,4 +2263,4 @@ def create_enhanced_plotly_chart(df, x, y, title, y_label):
         hovermode='x unified'
     )
     
-    return fig
+    return fig# Ensuring Git detects changes
