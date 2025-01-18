@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.express as px
+import plotly.graph_objects as go
 
 def get_token_metrics(results):
     """
@@ -73,89 +74,183 @@ def calculate_reserve_health(current_reserve, initial_reserve):
         return "Critical 🔴", ratio
 
 def calculate_reserve_metrics(results, initial_reserve):
-    """
-    Calculate comprehensive reserve metrics including time in critical levels and deficits.
+    """Calculate comprehensive reserve metrics with dynamic thresholds."""
+    # Calculate dynamic thresholds based on user count and activity
+    def calculate_dynamic_thresholds(row, initial_users, initial_reserve):
+        """Calculate warning and critical thresholds based on current metrics."""
+        user_factor = row['Users'] / initial_users
+        activity_factor = (row['Tokens Spent'] + row['Premium Users'] * 10) / initial_reserve
+        
+        # Thresholds become stricter as user base and activity grow
+        warning_threshold = initial_reserve * 0.5 * (1 + np.log1p(user_factor * activity_factor))
+        critical_threshold = initial_reserve * 0.25 * (1 + np.log1p(user_factor * activity_factor))
+        
+        return warning_threshold, critical_threshold
     
-    Args:
-        results: DataFrame with simulation results
-        initial_reserve: Initial reward pool size
+    # Get initial users
+    initial_users = results['Users'].iloc[0]
     
-    Returns:
-        dict: Comprehensive reserve metrics
-    """
-    warning_threshold = initial_reserve * 0.5
-    critical_threshold = initial_reserve * 0.25
+    # Calculate dynamic thresholds for each month
+    thresholds = pd.DataFrame({
+        'warning_threshold': results.apply(
+            lambda x: calculate_dynamic_thresholds(x, initial_users, initial_reserve)[0], 
+            axis=1
+        ),
+        'critical_threshold': results.apply(
+            lambda x: calculate_dynamic_thresholds(x, initial_users, initial_reserve)[1], 
+            axis=1
+        )
+    })
     
-    # Calculate time spent in each state
-    total_months = len(results)
-    months_in_warning = len(results[
-        (results['Reward Pool'] <= warning_threshold) & 
-        (results['Reward Pool'] > critical_threshold)
-    ])
-    months_in_critical = len(results[
-        (results['Reward Pool'] <= critical_threshold) & 
-        (results['Reward Pool'] > 0)
-    ])
-    months_in_deficit = len(results[results['Reward Pool'] <= 0])
-    
-    # Calculate cumulative deficit
-    deficit_mask = results['Reward Pool'] < 0
-    cumulative_deficit = abs(results.loc[deficit_mask, 'Reward Pool'].sum())
-    
-    # Calculate recovery metrics
-    recovery_count = 0
-    current_state = "healthy"
-    for _, row in results.iterrows():
-        if row['Reward Pool'] <= critical_threshold and current_state != "critical":
-            current_state = "critical"
-        elif row['Reward Pool'] > warning_threshold and current_state == "critical":
-            current_state = "healthy"
-            recovery_count += 1
-    
-    # Calculate volatility
-    reserve_volatility = results['Reward Pool'].std() / initial_reserve * 100
-    
-    # Calculate minimum reserve ratio
-    min_reserve_ratio = results['Reward Pool'].min() / initial_reserve
-    
-    return {
-        'warning_threshold': warning_threshold,
-        'critical_threshold': critical_threshold,
-        'months_in_warning': months_in_warning,
-        'months_in_critical': months_in_critical,
-        'months_in_deficit': months_in_deficit,
-        'warning_percentage': (months_in_warning / total_months) * 100,
-        'critical_percentage': (months_in_critical / total_months) * 100,
-        'deficit_percentage': (months_in_deficit / total_months) * 100,
-        'cumulative_deficit': cumulative_deficit,
-        'recovery_count': recovery_count,
-        'reserve_volatility': reserve_volatility,
-        'min_reserve_ratio': min_reserve_ratio
+    # Initialize state tracking with dynamic thresholds
+    states = {
+        "healthy": lambda x, w: x > w,
+        "warning": lambda x, w, c: c < x <= w,
+        "critical": lambda x, c: 0 < x <= c,
+        "deficit": lambda x: x <= 0
     }
+    
+    # Track state transitions and recoveries
+    current_state = "healthy"
+    recovery_events = []
+    consecutive_months_below = 0
+    lowest_point = float('inf')
+    state_history = []
+    
+    for i, row in results.iterrows():
+        reserve = row['Reward Pool']
+        warning_threshold = thresholds.loc[i, 'warning_threshold']
+        critical_threshold = thresholds.loc[i, 'critical_threshold']
+        
+        # Determine current state with dynamic thresholds
+        if states["healthy"](reserve, warning_threshold):
+            new_state = "healthy"
+        elif states["warning"](reserve, warning_threshold, critical_threshold):
+            new_state = "warning"
+        elif states["critical"](reserve, critical_threshold):
+            new_state = "critical"
+        else:
+            new_state = "deficit"
+        
+        state_history.append(new_state)
+        
+        # Track consecutive months below warning threshold
+        if new_state in ["warning", "critical", "deficit"]:
+            consecutive_months_below += 1
+            lowest_point = min(lowest_point, reserve)
+        else:
+            # Record recovery if returning to healthy from a non-healthy state
+            if consecutive_months_below >= 2 and current_state != "healthy":
+                recovery_events.append({
+                    'month': i,
+                    'from_state': current_state,
+                    'duration': consecutive_months_below,
+                    'lowest_point': lowest_point,
+                    'recovery_magnitude': (reserve - lowest_point) / initial_reserve
+                })
+            consecutive_months_below = 0
+            lowest_point = float('inf')
+        
+        current_state = new_state
+    
+    # Calculate time in each state
+    total_months = len(results)
+    state_counts = pd.Series(state_history).value_counts()
+    
+    metrics = {
+        'months_in_warning': state_counts.get('warning', 0),
+        'months_in_critical': state_counts.get('critical', 0),
+        'months_in_deficit': state_counts.get('deficit', 0),
+        'warning_percentage': (state_counts.get('warning', 0) / total_months) * 100,
+        'critical_percentage': (state_counts.get('critical', 0) / total_months) * 100,
+        'deficit_percentage': (state_counts.get('deficit', 0) / total_months) * 100,
+        'min_reserve_ratio': results['Reward Pool'].min() / initial_reserve,  # Add this line
+        'warning_threshold': thresholds['warning_threshold'].mean(),
+        'critical_threshold': thresholds['critical_threshold'].mean()
+    }
+    
+    # Calculate recovery strength with weighted impact
+    recovery_strength = 0
+    if recovery_events:
+        weighted_recoveries = [
+            event['recovery_magnitude'] * (1 + 0.5 * (event['from_state'] == 'critical'))
+            for event in recovery_events
+        ]
+        recovery_strength = np.mean(weighted_recoveries)
+    
+    # Add threshold and state history to results
+    metrics.update({
+        'dynamic_thresholds': thresholds,
+        'state_history': state_history,
+        'recovery_events': recovery_events,
+        'recovery_count': len(recovery_events),
+        'recovery_strength': recovery_strength * 100,
+        'avg_warning_threshold': thresholds['warning_threshold'].mean(),
+        'avg_critical_threshold': thresholds['critical_threshold'].mean(),
+        'current_state': current_state,
+        'consecutive_months_below': consecutive_months_below
+    })
+    
+    # Calculate stability score based on state percentages
+    stability_score = 100 * (1 - (
+        metrics['warning_percentage'] + 
+        metrics['critical_percentage'] * 2 + 
+        metrics['deficit_percentage'] * 3
+    ) / 300)  # Weighted impact of different states
+    
+    # Add stability score to metrics dictionary
+    metrics.update({
+        'stability_score': stability_score  # Add this line
+    })
+    
+    return metrics
 
-def calculate_monthly_burn_metrics(current_reserve, initial_reserve, months):
-    """
-    Calculate burn rate metrics and projected depletion timeline.
+def calculate_monthly_burn_metrics(current_reserve, initial_reserve, months, results_df):
+    """Calculate comprehensive burn rate metrics accounting for rewards, revenue, and token burning."""
+    # Calculate recent reserve changes (last 3 months)
+    recent_months = min(3, months)
+    recent_reserve_change = results_df['Reward Pool'].iloc[-recent_months:].diff().fillna(0)
     
-    Args:
-        current_reserve: Current reward pool balance
-        initial_reserve: Initial reward pool size
-        months: Number of months simulated
+    # Separate growth from burn
+    recent_burns = recent_reserve_change[recent_reserve_change < 0]
+    recent_growth = recent_reserve_change[recent_reserve_change > 0]
     
-    Returns:
-        dict: Burn rate metrics including monthly burn, burn rate percentage, and months remaining
-    """
-    # Calculate total burned and monthly burn rate
-    total_burned = initial_reserve - current_reserve
-    monthly_burn = total_burned / months if months > 0 else 0
+    # Calculate average monthly burn (only from periods with actual burns)
+    recent_monthly_burn = abs(recent_burns.mean()) if not recent_burns.empty else 0
+    recent_monthly_growth = recent_growth.mean() if not recent_growth.empty else 0
     
-    # Calculate months until depletion at current burn rate
-    months_remaining = current_reserve / monthly_burn if monthly_burn > 0 else float('inf')
+    # Calculate net burn/growth rate
+    net_monthly_change = recent_reserve_change.mean()
+    
+    # Calculate burn rate relative to revenue (using absolute values)
+    recent_revenue = results_df['Platform Revenue ($)'].iloc[-recent_months:].mean()
+    revenue_burn_ratio = recent_monthly_burn / recent_revenue if recent_revenue > 0 else 0
+    
+    # Calculate sustainable burn rate (cap at 50% of revenue or 5% of current reserve, whichever is lower)
+    max_sustainable_from_revenue = recent_revenue * 0.5
+    max_sustainable_from_reserve = current_reserve * 0.05
+    sustainable_burn = min(max_sustainable_from_revenue, max_sustainable_from_reserve)
+    
+    # Determine if current burn rate is sustainable
+    is_sustainable = (recent_monthly_burn <= sustainable_burn) if recent_monthly_burn > 0 else True
+    
+    # Calculate months until depletion (only if there's net negative change)
+    if net_monthly_change < 0:
+        months_remaining = current_reserve / abs(net_monthly_change)
+    else:
+        months_remaining = float('inf')
     
     return {
-        'monthly_burn': monthly_burn,
-        'burn_rate_pct': (monthly_burn / initial_reserve) * 100,
-        'months_remaining': months_remaining
+        'monthly_burn': recent_monthly_burn,
+        'monthly_growth': recent_monthly_growth,
+        'net_monthly_change': net_monthly_change,
+        'burn_rate_pct': (recent_monthly_burn / initial_reserve * 100) if recent_monthly_burn > 0 else 0,
+        'growth_rate_pct': (recent_monthly_growth / initial_reserve * 100) if recent_monthly_growth > 0 else 0,
+        'months_remaining': months_remaining,
+        'revenue_burn_ratio': revenue_burn_ratio,
+        'is_sustainable': is_sustainable,
+        'sustainable_burn': sustainable_burn,
+        'burn_sustainability': ((sustainable_burn - recent_monthly_burn) / sustainable_burn * 100) if sustainable_burn > 0 and recent_monthly_burn > 0 else 100
     }
 
 # Create a number input for total users with scientific notation support
@@ -311,31 +406,126 @@ def calculate_token_price(
     total_tokens_spent,
     price_elasticity,
     market_sentiment,
+    user_growth_rate,
+    transaction_volume,
+    staked_ratio,
+    current_month,  # Add current_month parameter
+    price_history
 ):
+    """Calculate token price with dampened factors and realistic bounds."""
     if total_tokens_issued <= 0:
         return base_price
 
-    # Ensure supply_demand_ratio is positive
-    supply_demand_ratio = max(0.001, total_tokens_spent / total_tokens_issued)
-
-    price = base_price * (supply_demand_ratio**price_elasticity) * market_sentiment
-    return max(0.01, price)
-
-def simulate_market_sentiment(initial_sentiment, volatility, trend):
-    """
-    Simulates market sentiment changes with controlled volatility.
+    # Calculate supply/demand ratio with tighter bounds
+    supply_demand_ratio = np.clip(
+        total_tokens_spent / total_tokens_issued if total_tokens_issued > 0 else 0,
+        0.2,  # Minimum 0.2x impact
+        2.0   # Maximum 2x impact
+    )
     
-    Args:
-        initial_sentiment: Current market sentiment value
-        volatility: How much sentiment can change (clipped between 1-5%)
-        trend: Long-term trend direction
+    # Calculate velocity dampening with reduced impact
+    velocity = transaction_volume / total_tokens_issued if total_tokens_issued > 0 else 1
+    velocity_factor = 1 / (1 + velocity * 0.5)  # Reduced velocity impact
+    velocity_factor = np.clip(velocity_factor, 0.5, 1.5)  # Bound velocity impact
     
-    Returns:
-        new_sentiment: Updated market sentiment value
+    # Calculate staking impact with diminishing returns
+    staking_factor = 1 + (staked_ratio * 0.3)  # Changed from staking_ratio to staked_ratio
+    staking_factor = min(1.3, staking_factor)  # Cap at 30% boost
+    
+    # Calculate growth premium with diminishing returns
+    growth_premium = 1 + max(0, min(user_growth_rate * 1.5, 0.5))  # Cap at 50% premium
+    
+    # Apply sentiment with reduced volatility
+    dampened_sentiment = 1 + (market_sentiment - 1) * 0.7  # Reduce sentiment impact
+    
+    # Calculate base price impact
+    price = (
+        base_price * 
+        (supply_demand_ratio ** (price_elasticity * 0.7)) *  # Reduce elasticity impact
+        dampened_sentiment * 
+        velocity_factor * 
+        staking_factor * 
+        growth_premium
+    )
+    
+    # Apply progressive price bounds
+    max_price_multiplier = 1 + (np.log1p(current_month) * 0.5)  # Use current_month parameter
+    max_price = base_price * max_price_multiplier
+    min_price = base_price * 0.2  # Floor at 20% of initial price
+    
+    # Smooth price changes
+    if len(price_history) > 0:
+        previous_price = price_history[-1]
+        max_change = previous_price * 0.15  # Max 15% change per period
+        price = np.clip(
+            price,
+            previous_price - max_change,
+            previous_price + max_change
+        )
+    
+    return np.clip(price, min_price, max_price)
+
+def simulate_market_sentiment(
+    initial_sentiment,
+    volatility,
+    trend,
+    user_growth,
+    price_change,
+    transaction_volume_change,
+    sentiment_history=None  # Add sentiment history parameter
+):
     """
-    sentiment = initial_sentiment
-    sentiment += np.random.normal(0, volatility) + trend
-    return max(0.1, min(2.0, sentiment))  # Bound sentiment between 0.1 and 2.0
+    Simulates market sentiment changes with smoothing and realistic market psychology.
+    """
+    # Initialize sentiment history if None
+    if sentiment_history is None:
+        sentiment_history = []
+    
+    # Calculate base sentiment change with reduced volatility
+    base_change = np.random.normal(0, volatility * 0.7) + (trend * 0.5)
+    
+    # Apply moving average smoothing if we have history
+    if sentiment_history:
+        last_changes = np.diff(sentiment_history[-3:]) if len(sentiment_history) >= 3 else [0]
+        avg_change = np.mean(last_changes)
+        base_change = 0.7 * base_change + 0.3 * avg_change
+    
+    # Calculate user growth impact with momentum
+    growth_impact = 0
+    if user_growth > 0:
+        growth_impact = min(user_growth * 0.08, 0.03)  # Reduced from 0.1 to 0.08
+    else:
+        growth_impact = max(user_growth * 0.12, -0.04)  # Stronger negative impact
+    
+    # Calculate price momentum effect
+    price_momentum = 0
+    if len(sentiment_history) >= 2:
+        price_trend = np.mean([price_change, price_change * 0.5])  # Weighted recent price change
+        price_momentum = np.clip(price_trend * 0.08, -0.03, 0.03)
+    
+    # Calculate volume impact with threshold
+    volume_impact = 0
+    if abs(transaction_volume_change) > 0.1:  # Only consider significant volume changes
+        volume_impact = np.clip(transaction_volume_change * 0.05, -0.02, 0.02)
+    
+    # Combine all factors with weighted importance
+    sentiment_change = (
+        base_change * 0.4 +          # Base random walk (40%)
+        growth_impact * 0.3 +        # User growth impact (30%)
+        price_momentum * 0.2 +       # Price momentum (20%)
+        volume_impact * 0.1          # Volume impact (10%)
+    )
+    
+    # Apply mean reversion
+    distance_from_neutral = initial_sentiment - 1.0
+    mean_reversion = -distance_from_neutral * 0.1  # 10% reversion to mean
+    sentiment_change += mean_reversion
+    
+    # Calculate new sentiment with tighter bounds
+    new_sentiment = initial_sentiment + sentiment_change
+    new_sentiment = np.clip(new_sentiment, 0.7, 1.3)  # Tighter bounds
+    
+    return new_sentiment
 
 # Add this function before the simulate_tokenomics function
 def vesting_schedule(month, total_vested, vest_duration):
@@ -357,34 +547,75 @@ def vesting_schedule(month, total_vested, vest_duration):
     else:
         return (total_vested / vest_duration) * 0.2  # Vest 20% during cliff
 
-# Add this function before the simulate_tokenomics function
 def logistic_growth(current_month, carrying_capacity, initial_base_users, growth_steepness, midpoint):
     """
-    Implements an S-curve growth model using the logistic function.
+    Implements an S-curve growth model using the logistic function with market saturation effects.
     
     Args:
-        current_month: Current month in simulation (0-based)
-        carrying_capacity: Maximum possible users (usually TAM)
+        current_month: Current month in simulation
+        carrying_capacity: Maximum possible users (TAM)
         initial_base_users: Starting number of users
-        growth_steepness: Controls how steep the S-curve is (typically 0.1-0.5)
+        growth_steepness: Controls how steep the S-curve is (0.1-0.5)
         midpoint: Month at which growth is ~50% of capacity
     
     Returns:
-        user_count: Projected number of users at this point in time
+        int: Projected number of users at this point
     """
     # Ensure parameters are within valid ranges
     growth_steepness = np.clip(growth_steepness, 0.1, 0.5)
     carrying_capacity = max(carrying_capacity, initial_base_users * 2)
     midpoint = max(1, midpoint)
     
-    # Calculate logistic growth
-    growth_factor = -growth_steepness * (current_month - midpoint)
+    # Calculate market saturation factor (reduces growth as we approach capacity)
+    saturation_factor = 1 - (initial_base_users / carrying_capacity)
+    
+    # Apply saturation-adjusted logistic growth
+    growth_factor = -growth_steepness * saturation_factor * (current_month - midpoint)
     user_count = carrying_capacity / (1 + np.exp(growth_factor))
     
-    # Ensure we don't go below initial users or above carrying capacity
-    user_count = max(initial_base_users, min(user_count, carrying_capacity))
+    # Apply additional growth dampening near capacity
+    proximity_to_capacity = user_count / carrying_capacity
+    if proximity_to_capacity > 0.7:  # Start dampening at 70% of capacity
+        dampening = 1 - ((proximity_to_capacity - 0.7) / 0.3)  # Linear reduction
+        user_count *= dampening
     
-    return user_count
+    # Ensure we don't go below initial users or above carrying capacity
+    return int(max(initial_base_users, min(user_count, carrying_capacity * 0.95)))  # Cap at 95% of TAM
+
+def calculate_competitor_impact(
+    users, 
+    token_price, 
+    initial_token_price, 
+    competitor_attractiveness,
+    market_saturation
+):
+    """
+    Calculate enhanced competitor impact with market saturation effects.
+    
+    Args:
+        users: Current number of users
+        token_price: Current token price
+        initial_token_price: Initial token price
+        competitor_attractiveness: Base competitor attractiveness
+        market_saturation: Current market saturation level
+    
+    Returns:
+        float: Adjusted competitor churn rate
+    """
+    # Base effect from token price
+    price_effect = max(0, 1 - token_price / initial_token_price)
+    
+    # Market saturation increases competition
+    saturation_multiplier = 1 + (market_saturation * 2)  # 2x effect at full saturation
+    
+    # Calculate final effect with bounds
+    competitor_effect = (
+        competitor_attractiveness * 
+        price_effect * 
+        saturation_multiplier
+    )
+    
+    return np.clip(competitor_effect, 0.01, 0.05)  # Bound between 1-5% monthly churn
 
 # --- Function to Create Sliders with Customizable Ranges and Error Handling---
 def create_slider_with_range(
@@ -438,42 +669,83 @@ def create_slider_with_range(
 # --- Main Simulation Function ---
 
 def apply_shock_event(current_params, event_info):
-    """
-    Applies shock event modifications to simulation parameters.
-    Returns modified parameters without altering the originals.
-    
-    Args:
-        current_params: dict of current simulation parameters
-        event_info: dict containing shock event modifications
-    
-    Returns:
-        dict: Modified parameters for this month
-    """
-    # Create a copy of current parameters to modify
+    """Applies shock event modifications with enhanced impact calculations."""
     params = current_params.copy()
     
-    # Apply growth rate modifications
+    # Track cascading effects
+    cascade_effects = {
+        "sentiment_impact": 0,
+        "price_impact": 0,
+        "user_impact": 0,
+        "revenue_impact": 0
+    }
+    
+    # Growth rate modifications with cascading effects
     if "growth_rate_boost" in event_info:
-        params["growth_rate"] = params.get("growth_rate", 0) + event_info["growth_rate_boost"]
-        params["growth_rate"] = max(0, min(params["growth_rate"], 1.0))  # Bound between 0-100%
+        base_adjustment = event_info["growth_rate_boost"]
+        # Amplify negative shocks significantly more
+        if base_adjustment < 0:
+            adjustment = base_adjustment * 2.0  # Double negative impact
+            cascade_effects["sentiment_impact"] -= 0.3  # Large sentiment hit
+            cascade_effects["price_impact"] -= 0.2  # Price pressure
+        else:
+            adjustment = base_adjustment * 1.3  # 30% stronger positive impact
+            cascade_effects["sentiment_impact"] += 0.1
+        
+        params["growth_rate"] = max(0, min(1.0, params.get("growth_rate", 0) + adjustment))
+        params["growth_shock_recovery"] = 6  # Takes 6 months to recover
 
-    # Apply sentiment modifications
+    # Sentiment modifications with market psychology
     if "sentiment_shift" in event_info:
-        params["market_sentiment"] = params.get("market_sentiment", 1.0) + event_info["sentiment_shift"]
-        params["market_sentiment"] = max(0.1, min(params["market_sentiment"], 2.0))  # Bound between 0.1-2.0
+        base_shift = event_info["sentiment_shift"]
+        # Add market psychology effects
+        if base_shift < 0:
+            cascade_effects["price_impact"] -= 0.15  # Price pressure
+            cascade_effects["user_impact"] -= 0.1  # User confidence impact
+        params["sentiment_shift"] = base_shift * 1.5  # 50% stronger
+        params["sentiment_persistence"] = 4  # Longer persistence
+        params["market_sentiment"] = max(0.1, min(2.0, 
+            params.get("market_sentiment", 1.0) + base_shift + cascade_effects["sentiment_impact"]))
 
-    # Apply inactivity rate modifications
+    # Inactivity spike with network effects
     if "inactivity_spike" in event_info:
-        params["inactivity_rate"] = params.get("inactivity_rate", 0.05) + event_info["inactivity_spike"]
-        params["inactivity_rate"] = max(0.01, min(params["inactivity_rate"], 0.15))  # Bound between 1-15%
+        base_spike = event_info["inactivity_spike"] * 1.5  # 50% stronger
+        params["inactivity_rate"] = max(0.01, min(0.3, 
+            params.get("inactivity_rate", 0.05) + base_spike))
+        params["competitor_multiplier"] = 2.0  # Doubled competitor effectiveness
+        cascade_effects["sentiment_impact"] -= 0.2
+        cascade_effects["revenue_impact"] -= 0.15
 
-    # Apply token price shock
+    # Price shocks with market contagion
     if "price_shock" in event_info:
-        params["token_price_multiplier"] = event_info["price_shock"]
+        shock_multiplier = event_info["price_shock"]
+        params["token_price_multiplier"] = shock_multiplier
+        
+        # Market contagion effects
+        if shock_multiplier < 1:
+            cascade_effects["sentiment_impact"] -= 0.25
+            cascade_effects["user_impact"] -= 0.15
+            params["staking_modifier"] = 0.5  # Reduced staking
+        else:
+            cascade_effects["sentiment_impact"] += 0.15
+            params["staking_modifier"] = 1.5  # Increased staking
 
-    # Apply reward pool modifications
+    # Reward pool modifications with ecosystem impact
     if "reward_pool_change" in event_info:
-        params["reward_pool_modifier"] = event_info["reward_pool_change"]
+        change_multiplier = event_info["reward_pool_change"]
+        params["reward_pool_modifier"] = change_multiplier
+        
+        if change_multiplier < 1:
+            cascade_effects["sentiment_impact"] -= 0.2
+            cascade_effects["user_impact"] -= 0.1
+            params["staking_modifier"] = 0.7
+        
+        # Add ecosystem effects
+        params["reward_adjustment"] = 1 + (change_multiplier - 1) * 0.7
+
+    # Apply cascade effects
+    params["cascade_effects"] = cascade_effects
+    params["shock_intensity"] = sum(abs(v) for v in cascade_effects.values())
 
     return params
 
@@ -546,22 +818,25 @@ def simulate_tokenomics(
     user_segments = {
         "power": {
             "proportion": 0.1,
-            "contribution_multiplier": 5,
-            "lookup_multiplier": 2,
-            "premium_adoption_multiplier": 2,
+            "contribution_multiplier": 3.0,  # Reduced from 5.0 to 3.0
+            "lookup_multiplier": 1.5,        # Reduced from 2.0 to 1.5
+            "premium_adoption_multiplier": 1.5,  # Reduced from 2.0 to 1.5
+            "churn_resistance": 0.8  # Power users are 20% less likely to churn
         },
         "regular": {
             "proportion": 0.6,
-            "contribution_multiplier": 1,
-            "lookup_multiplier": 1,
-            "premium_adoption_multiplier": 1,
+            "contribution_multiplier": 1.0,
+            "lookup_multiplier": 1.0,
+            "premium_adoption_multiplier": 1.0,
+            "churn_resistance": 1.0
         },
         "casual": {
             "proportion": 0.3,
-            "contribution_multiplier": 0.2,
+            "contribution_multiplier": 0.3,  # Increased from 0.2 to 0.3
             "lookup_multiplier": 0.5,
             "premium_adoption_multiplier": 0.5,
-        },
+            "churn_resistance": 1.2  # Casual users are 20% more likely to churn
+        }
     }
 
     monthly_results = []
@@ -598,6 +873,26 @@ def simulate_tokenomics(
             if 1 <= month <= months
         }
 
+    # Initialize tracking variables
+    previous_price = initial_token_price
+    previous_transaction_volume = 0
+    price_history = []
+
+    # Initialize enhanced shock tracking
+    shock_effects = {
+        "sentiment_persistence": 0,
+        "growth_shock_recovery": 0,
+        "competitor_multiplier": 1.0,
+        "staking_modifier": 1.0,
+        "cascade_effects": {},
+        "shock_intensity": 0,
+        "segment_impact": False  # Add this line
+    }
+
+    # Add sentiment history tracking
+    sentiment_history = []
+    price_change_history = []
+
     # --- Simulation Loop ---
     for month in range(months):
         current_month = month + 1
@@ -607,18 +902,36 @@ def simulate_tokenomics(
             # Get modified parameters for this month
             modified_params = apply_shock_event(current_params, shock_events[current_month])
             
-            # Apply modified parameters
-            effective_growth_rate = modified_params["growth_rate"]
+            # Check if any segment modifiers exist in the event
+            has_segment_impact = any(
+                key.endswith("_modifier") and key.split("_")[0] in user_segments
+                for key in shock_events[current_month].keys()
+            )
+            shock_effects["segment_impact"] = has_segment_impact
+            
+            # Apply immediate parameter changes
+            effective_growth_rate *= (1 + modified_params["cascade_effects"]["user_impact"])
             market_sentiment = modified_params["market_sentiment"]
             inactivity_rate = modified_params["inactivity_rate"]
             
-            # Apply token price shock if present
-            if modified_params["token_price_multiplier"] != 1.0:
-                token_price *= modified_params["token_price_multiplier"]
+            # Store shock effects
+            shock_effects.update({
+                "sentiment_persistence": modified_params.get("sentiment_persistence", 0),
+                "growth_shock_recovery": modified_params.get("growth_shock_recovery", 0),
+                "competitor_multiplier": modified_params.get("competitor_multiplier", 1.0),
+                "staking_modifier": modified_params.get("staking_modifier", 1.0),
+                "cascade_effects": modified_params["cascade_effects"],
+                "shock_intensity": modified_params["shock_intensity"]
+            })
             
-            # Apply reward pool modification if present
-            if modified_params["reward_pool_modifier"] != 1.0:
-                reward_pool *= modified_params["reward_pool_modifier"]
+            # Apply price and reward pool shocks with intensity scaling
+            if "token_price_multiplier" in modified_params:
+                intensity_factor = 1 + shock_effects["shock_intensity"] * 0.2
+                token_price *= modified_params["token_price_multiplier"] * intensity_factor
+            
+            if "reward_pool_modifier" in modified_params:
+                intensity_factor = 1 + shock_effects["shock_intensity"] * 0.15
+                reward_pool *= modified_params["reward_pool_modifier"] * intensity_factor
 
         # Track shock event occurrences
         shock_event_description = None
@@ -644,38 +957,60 @@ def simulate_tokenomics(
 
         # 2. USER GROWTH & COMPETITION (modified for logistic)
         if logistic_enabled:
-            # We compute the logistic-based user count for this month
+            # Calculate market saturation
+            market_saturation = users / carrying_capacity
+            
+            # Adjust growth parameters based on saturation
+            adjusted_steepness = growth_steepness * (1 - market_saturation)
+            adjusted_midpoint = max(midpoint_month, current_month * (1 - market_saturation))
+            
+            # Calculate logistic growth with adjusted parameters
             logistic_user_count = logistic_growth(
                 current_month=month,
                 carrying_capacity=carrying_capacity,
                 initial_base_users=base_users,
-                growth_steepness=growth_steepness,
-                midpoint=midpoint_month
+                growth_steepness=adjusted_steepness,
+                midpoint=adjusted_midpoint
             )
-            new_users = int(logistic_user_count - users) if logistic_user_count > users else 0
+            new_users = int(max(0, logistic_user_count - users))
         else:
-            # Your original code path: purely linear-based approach
-            new_users = int(users * effective_growth_rate)
+            # Linear growth with saturation effect
+            market_saturation = users / total_addressable_market
+            saturation_factor = 1 - market_saturation
+            effective_growth = effective_growth_rate * saturation_factor
+            new_users = int(users * effective_growth)
 
-        # Apply competition and churn effects
-        churned_users = int(users * np.clip(inactivity_rate, 0.03, 0.08))
+        # Enhanced competition and churn effects
+        base_churn = np.clip(inactivity_rate * (1 + market_saturation), 0.03, 0.12)
+        churned_users = int(users * base_churn)
 
-        # Include competitor effects with safeguards
+        # Calculate competitor effects with market saturation
         competitor_churn = 0
         for i in range(num_competitors):
-            competitor_effect = np.clip(
-                competitor_attractiveness[i] * (1 - token_price / initial_token_price),
-                0,
-                0.03  # Cap maximum user loss to any single competitor at 3%
+            effect = calculate_competitor_impact(
+                users,
+                token_price,
+                initial_token_price,
+                competitor_attractiveness[i],
+                market_saturation
             )
-            competitor_churn += int(users * competitor_effect)
-        
+            competitor_churn += int(users * effect)
+
+        # Apply total churn
         churned_users += competitor_churn
 
-        # Update total users with bounds checking
+        # Update total users with enhanced bounds checking
         previous_users = users
         users += new_users - churned_users
-        users = max(base_users * 0.5, min(users, carrying_capacity))  # Never drop below 50% of base or exceed capacity
+
+        # Apply stricter bounds as we approach capacity
+        max_users = int(carrying_capacity * 0.95)  # Cap at 95% of TAM
+        if users > max_users:
+            excess_users = users - max_users
+            churn_adjustment = int(excess_users * 0.2)  # Gradually reduce excess
+            users = max_users - churn_adjustment
+
+        users = max(base_users * 0.5, users)  # Maintain minimum user base
         
         # Calculate actual growth rate for metrics
         actual_growth_rate = (users - previous_users) / previous_users if previous_users > 0 else 0
@@ -685,122 +1020,95 @@ def simulate_tokenomics(
             segment: int(users * data["proportion"]) for segment, data in user_segments.items()
         }
 
-        # 3. Line-Item Contributions
-        # Calculate total contributions across all segments
-        total_contributions = sum(segment_counts[segment] * user_segments[segment]["contribution_multiplier"] for segment in user_segments)
+        # Calculate segment counts with dynamic proportions based on growth
+        def calculate_segment_distribution(users, previous_segment_counts, user_segments):
+            """Calculate segment counts with growth-based transitions."""
+            new_segment_counts = {}
+            
+            # Calculate base distribution
+            base_counts = {
+                segment: int(users * data["proportion"])
+                for segment, data in user_segments.items()
+            }
+            
+            # Adjust for user growth and segment transitions
+            if previous_segment_counts:
+                for segment in user_segments:
+                    # Calculate segment growth
+                    segment_growth = base_counts[segment] - previous_segment_counts[segment]
+                    
+                    if segment_growth > 0:
+                        # For positive growth, apply segment-specific retention
+                        retention_rate = user_segments[segment]["churn_resistance"]
+                        new_segment_counts[segment] = int(
+                            previous_segment_counts[segment] * retention_rate +
+                            segment_growth
+                        )
+                    else:
+                        # For negative growth, maintain proportion
+                        new_segment_counts[segment] = base_counts[segment]
+            else:
+                new_segment_counts = base_counts
+            
+            # Ensure total matches user count
+            total_in_segments = sum(new_segment_counts.values())
+            if total_in_segments != users:
+                # Adjust largest segment to match total
+                largest_segment = max(new_segment_counts, key=new_segment_counts.get)
+                new_segment_counts[largest_segment] += (users - total_in_segments)
+            
+            return new_segment_counts
 
-        # Distribute rewards proportionally based on contributions
-        monthly_rewards = 0
-        reward *= 1 - np.clip(reward_decay_rate, 0.01, 0.05)  # Clip decay rate between 1-5%
+        # Update the segment counts calculation in the simulation loop
+        previous_segment_counts = segment_counts.copy() if 'segment_counts' in locals() else None
+        segment_counts = calculate_segment_distribution(users, previous_segment_counts, user_segments)
 
-        # Calculate and clip monthly contributions
-        monthly_contributions = total_contributions  # This should be your existing contributions calculation
-        if contribution_cap:
-            monthly_contributions = min(monthly_contributions, users * np.clip(contribution_cap, 200, 500))
+        # Calculate segment-specific metrics
+        segment_metrics = {
+            segment: {
+                'users': segment_counts[segment],
+                'contributions': segment_counts[segment] * data["contribution_multiplier"],
+                'lookups': (
+                    segment_counts[segment] * 
+                    customers_per_user * 
+                    (lookup_frequency / 12) * 
+                    data["lookup_multiplier"]
+                ),
+                'premium_users': int(
+                    segment_counts[segment] * 
+                    premium_adoption * 
+                    data["premium_adoption_multiplier"]
+                )
+            }
+            for segment, data in user_segments.items()
+        }
 
-        # Use monthly_contributions for reward calculations
-        if monthly_contributions > 0:  # Prevent division by zero
-            for segment in user_segments:
-                proportional_reward = (segment_counts[segment] * user_segments[segment]["contribution_multiplier"]) / total_contributions
-                segment_rewards = reward_pool * proportional_reward
-                monthly_rewards += segment_rewards
-                reward_pool -= segment_rewards
-
-        total_tokens_earned += monthly_rewards
-        reward *= 1 - reward_decay_rate
-
-        # 4. Search Activity (Lookups)
-        monthly_lookups = 0
-        for segment, data in user_segments.items():
-            monthly_lookups += (
-                segment_counts[segment]
-                * customers_per_user
-                * (lookup_frequency / 12)
-                * data["lookup_multiplier"]
-            )
-        monthly_lookups += users * new_customers_per_user
-        monthly_spending = monthly_lookups * search_fee
-        total_tokens_spent += monthly_spending
-
-        # Adjust lookup frequency based on token price and market sentiment
-        lookup_frequency_adjustment = 1 + (initial_token_price - token_price) * 0.1 * market_sentiment
-        lookup_frequency *= max(0.5, min(2.0, lookup_frequency_adjustment))  # Bound adjustments
-
-        # Check if users need to purchase more tokens
-        for segment, balance in user_token_balances.items():
-            if balance < token_purchase_threshold:
-                tokens_to_buy = token_purchase_amount
-                user_token_balances[segment] += tokens_to_buy
-                platform_revenue += tokens_to_buy * token_sale_price
-
-        # 5. Premium Feature Spending
-        premium_spending = 0
-        for segment, data in user_segments.items():
-            premium_spending += (
-                segment_counts[segment]
-                * premium_adoption
-                * 10
-                * data["premium_adoption_multiplier"]
-            )
-        total_tokens_spent += premium_spending
-
-        # Update user token balances after spending
-        for segment, data in user_segments.items():
-            user_token_balances[segment] -= (
-                segment_counts[segment]
-                * premium_adoption
-                * 10
-                * data["premium_adoption_multiplier"]
-            )
-
-        # 6. Token Burning
-        tokens_to_burn = total_tokens_earned * min(burn_rate, 0.03)  # Cap burn rate at 3%
-        total_tokens_burned += tokens_to_burn
-        total_tokens_earned -= tokens_to_burn
-
-        # 7. Staking (simplified)
-        monthly_staking_apr = staking_apr / 12
-        staking_rewards = total_tokens_staked * monthly_staking_apr
-        reward_pool -= staking_rewards
-        total_tokens_earned += staking_rewards
-        reward_pool = max(0, reward_pool)  # Prevent negative reward pool
-
-        # Assume some users stake tokens each month (simplified logic)
-        new_tokens_staked = users * (token_price / initial_token_price) * 0.1  # More staking if token price is high
-        total_tokens_staked += new_tokens_staked
-        total_tokens_earned -= new_tokens_staked
-        total_tokens_staked = max(0, total_tokens_staked)  # Prevent negative staked tokens
-
-        # 8. Transaction Fees
-        transaction_fees = (monthly_spending * transaction_fee_rate) * token_price
-        platform_revenue += transaction_fees
-
-        # Use transaction fees for the reward pool and burning (example)
-        reward_pool += transaction_fees * 0.50
-        total_tokens_burned += transaction_fees * 0.25 * (1 / token_price)
-
-        # 9. Market Sentiment
-        market_sentiment = simulate_market_sentiment(
-            market_sentiment, 
-            np.clip(market_volatility, 0.01, 0.05),  # Clip volatility between 1-5%
-            0.01  # Slight positive trend
+        # Calculate total contributions with proper scaling
+        total_contributions = sum(
+            metrics['contributions'] 
+            for metrics in segment_metrics.values()
         )
 
-        # 10. Token Price
-        token_price = calculate_token_price(
-            initial_token_price,
-            total_tokens_earned,
-            total_tokens_spent,
-            price_elasticity,
-            market_sentiment,
+        # Calculate monthly spending with segment-specific rates
+        monthly_spending = sum(
+            metrics['lookups'] * search_fee
+            for metrics in segment_metrics.values()
         )
 
-        # 11. Platform Revenue (moved up from previous position 12)
-        platform_revenue += monthly_spending * token_price * 0.75
+        # Calculate premium spending with proper segment scaling
+        premium_spending = sum(
+            metrics['premium_users'] * 10  # Base premium cost
+            for metrics in segment_metrics.values()
+        )
 
-        # --- Store Monthly Results ---
-        monthly_results.append(
-            {
+        # Calculate monthly token spending
+        monthly_token_spending = monthly_spending + premium_spending
+        
+        # Update cumulative token spending
+        total_tokens_spent += monthly_token_spending
+
+        # Update monthly results with proper token spending metrics
+        monthly_results.append({
                 "Month": current_month,
                 "Users": users,
                 "Token Price": token_price,
@@ -813,8 +1121,16 @@ def simulate_tokenomics(
                 "Search Fee": search_fee,
                 "Reward": reward,
                 "Power Users": segment_counts["power"],
+            "Power User Contribution": segment_metrics["power"]["contributions"],
+            "Power User Premium": segment_metrics["power"]["premium_users"],
                 "Regular Users": segment_counts["regular"],
+            "Regular User Contribution": segment_metrics["regular"]["contributions"],
+            "Regular User Premium": segment_metrics["regular"]["premium_users"],
                 "Casual Users": segment_counts["casual"],
+            "Casual User Contribution": segment_metrics["casual"]["contributions"],
+            "Casual User Premium": segment_metrics["casual"]["premium_users"],
+            "Total Contributions": total_contributions,
+            "Premium Users": sum(metrics['premium_users'] for metrics in segment_metrics.values()),
                 "Total Tokens Staked": total_tokens_staked,
                 "Reward Pool": reward_pool,
                 "Token Sales Revenue": platform_revenue,
@@ -822,8 +1138,228 @@ def simulate_tokenomics(
                 "Target Growth Rate": effective_growth_rate if not logistic_enabled else None,
                 "Distance to Carrying Capacity": carrying_capacity - users if logistic_enabled else None,
                 "Shock Event": shock_event_description,
-            }
+            "Monthly Spending": monthly_spending + premium_spending,  # Add monthly spending
+            "Cumulative Spending": total_tokens_spent,  # Add cumulative spending
+            "Monthly Token Spending": monthly_token_spending,
+            "Premium Spending": premium_spending,
+            "Search Spending": monthly_spending,
+        })
+
+        # Update reward rate with decay
+        reward *= (1 - reward_decay_rate)
+        total_tokens_earned += monthly_spending + premium_spending
+
+        # Track total tokens spent
+        total_tokens_spent += monthly_spending + premium_spending
+
+        # 6. Transaction Fees and Revenue
+        # Calculate base transaction fees in tokens
+        base_transaction_fees = (monthly_spending + premium_spending) * transaction_fee_rate
+        
+        # Convert fees to revenue based on token price
+        transaction_revenue = base_transaction_fees * token_price
+        platform_revenue += transaction_revenue
+
+        # Calculate token distribution from revenue
+        tokens_from_revenue = transaction_revenue / token_price  # Convert revenue to tokens
+        reward_pool_share = tokens_from_revenue * 0.5  # 50% to reward pool
+        burn_share = tokens_from_revenue * 0.25  # 25% to burning
+        reserve_share = tokens_from_revenue * 0.25  # 25% to reserve
+
+        # 7. Reward Pool Management
+        # Calculate base rewards per user based on activity
+        base_reward_per_user = reward * (1 - reward_decay_rate)
+        
+        # Scale rewards based on user activity and contributions
+        activity_multiplier = (monthly_spending + premium_spending) / (users * search_fee)
+        activity_multiplier = np.clip(activity_multiplier, 0.5, 2.0)  # Bound multiplier
+        
+        # Calculate total monthly rewards with user scaling
+        monthly_rewards = min(
+            total_contributions * base_reward_per_user * activity_multiplier,  # Activity-based rewards
+            reward_pool * (0.05 + (0.05 * (users / base_users)))  # Dynamic pool drain rate
         )
+        
+        # Calculate revenue-based pool replenishment
+        user_scaled_revenue = transaction_revenue * (users / base_users)
+        reward_pool_addition = min(
+            user_scaled_revenue * reward_pool_share,
+            reward_pool_size * 0.2  # Cap monthly addition at 20% of initial size
+        )
+        
+        # Update reward pool with proper scaling
+        reward_pool = max(0, reward_pool - monthly_rewards)  # Remove rewards
+        reward_pool += reward_pool_addition  # Add scaled revenue share
+        
+        # Apply dynamic pool cap based on user growth
+        user_growth_factor = max(1.0, np.log1p(users / base_users))
+        max_pool_size = reward_pool_size * user_growth_factor
+        reward_pool = min(reward_pool, max_pool_size)
+
+        # 8. Token Burning
+        # Calculate user-scaled burn rate
+        effective_burn_rate = burn_rate * (1 + np.log1p(users / base_users) * 0.2)
+        
+        # Calculate burn from rewards with user scaling
+        reward_burn = min(
+            monthly_rewards * effective_burn_rate,
+            monthly_rewards * 0.05  # Cap at 5%
+        )
+        
+        # Calculate burn from excess rewards relative to user base
+        excess_rewards = max(0, monthly_rewards - (transaction_revenue / token_price))
+        excess_burn = excess_rewards * min(0.15, 0.1 * (users / base_users))
+        
+        # Calculate revenue burn with user scaling
+        revenue_burn = (transaction_revenue * burn_share) / token_price
+        revenue_burn *= (1 + np.log1p(users / base_users) * 0.1)
+        
+        # Total burn calculation with user-based cap
+        max_burn = total_tokens_earned * (0.3 + (0.2 * (users / base_users)))
+        total_burn = min(
+            reward_burn + revenue_burn + excess_burn,
+            max_burn  # Dynamic burn cap
+        )
+
+        # Update token totals
+        total_tokens_burned += total_burn
+        total_tokens_earned = max(0, total_tokens_earned - total_burn)
+
+        # 9. Staking with user correlation
+        # Calculate dynamic APR based on user growth and pool health
+        pool_ratio = reward_pool / reward_pool_size
+        user_ratio = users / base_users
+        effective_apr = staking_apr * pool_ratio * min(2.0, np.sqrt(user_ratio))
+        monthly_staking_apr = effective_apr / 12
+        
+        # Calculate staking rewards with user-based cap
+        max_staking_rewards = reward_pool * (0.02 * min(2.0, np.sqrt(user_ratio)))
+        staking_rewards = min(
+            total_tokens_staked * monthly_staking_apr,
+            max_staking_rewards
+        )
+
+        # Update staking and reward pool
+        reward_pool = max(0, reward_pool - staking_rewards)
+        total_tokens_earned += staking_rewards
+
+        # Calculate new staking amount
+        base_staking_amount = users * (token_price / initial_token_price) * 0.1
+        new_tokens_staked = min(
+            base_staking_amount * shock_effects["staking_modifier"],
+            total_tokens_earned * 0.3  # Cap at 30% of earned tokens
+        )
+
+        # Update staking totals
+        total_tokens_staked = max(0, total_tokens_staked + new_tokens_staked)
+        total_tokens_earned = max(0, total_tokens_earned - new_tokens_staked)
+
+        # 9. Market Sentiment
+        # Calculate transaction volume
+        current_transaction_volume = monthly_spending + premium_spending
+        transaction_volume_change = (
+            (current_transaction_volume - previous_transaction_volume) / 
+            previous_transaction_volume if previous_transaction_volume > 0 else 0
+        )
+        
+        # Calculate user growth rate
+        current_growth_rate = (users - previous_users) / previous_users if previous_users > 0 else 0
+        
+        # Calculate staked ratio
+        staked_ratio = total_tokens_staked / total_tokens_earned if total_tokens_earned > 0 else 0
+        
+        # Calculate price change
+        if len(price_history) > 0:
+            current_price_change = (token_price - price_history[-1]) / price_history[-1]
+            price_change_history.append(current_price_change)
+        else:
+            current_price_change = 0
+        
+        # Update market sentiment with history
+        market_sentiment = simulate_market_sentiment(
+            market_sentiment,
+            market_volatility,
+            market_trend,
+            current_growth_rate,
+            current_price_change,
+            transaction_volume_change,
+            sentiment_history
+        )
+        
+        # Store sentiment for history
+        sentiment_history.append(market_sentiment)
+        
+        # Trim histories to keep last 12 months
+        if len(sentiment_history) > 12:
+            sentiment_history = sentiment_history[-12:]
+        if len(price_change_history) > 12:
+            price_change_history = price_change_history[-12:]
+            
+        # Calculate smoothed metrics for token price
+        smoothed_sentiment = np.mean(sentiment_history[-3:]) if len(sentiment_history) >= 3 else market_sentiment
+        smoothed_growth = np.mean([current_growth_rate] + price_change_history[-2:]) if price_change_history else current_growth_rate
+        
+        # Calculate token price with smoothed inputs
+        token_price = calculate_token_price(
+            initial_token_price,
+            total_tokens_earned,
+            total_tokens_spent,
+            price_elasticity,
+            smoothed_sentiment,  # Use smoothed sentiment
+            smoothed_growth,     # Use smoothed growth
+            current_transaction_volume,
+            staked_ratio,
+            current_month,
+            price_history
+        )
+        
+        # Store values for next iteration
+        previous_transaction_volume = current_transaction_volume
+        price_history.append(token_price)
+
+        # 10. Platform Revenue (moved up from previous position 12)
+        platform_revenue += monthly_spending * token_price * 0.75
+
+        # Apply persistent shock effects
+        if shock_effects["sentiment_persistence"] > 0:
+            recovery_factor = (shock_effects["sentiment_persistence"] / 4) ** 1.5
+            market_sentiment += shock_effects["cascade_effects"]["sentiment_impact"] * recovery_factor
+            shock_effects["sentiment_persistence"] -= 1
+
+        if shock_effects["growth_shock_recovery"] > 0:
+            recovery_factor = (shock_effects["growth_shock_recovery"] / 6) ** 2
+            effective_growth_rate *= (1 + shock_effects["cascade_effects"]["user_impact"] * recovery_factor)
+            shock_effects["growth_shock_recovery"] -= 1
+
+        # Modify competitor effects
+        competitor_churn = 0
+        for i in range(num_competitors):
+            effect = calculate_competitor_impact(
+                users,
+                token_price,
+                initial_token_price,
+                competitor_attractiveness[i] * shock_effects["competitor_multiplier"],
+                market_saturation
+            )
+            competitor_churn += int(users * effect)
+        
+        # Gradually reset shock effects
+        shock_effects["competitor_multiplier"] = max(1.0, shock_effects["competitor_multiplier"] * 0.9)
+        shock_effects["staking_modifier"] = 1.0 + (shock_effects["staking_modifier"] - 1.0) * 0.8
+
+        # Fix the indentation in the user segments section
+        if shock_effects["segment_impact"]:
+            # Adjust user segments based on shock effects
+            for segment in user_segments:
+                # Apply shock modifiers to each segment
+                segment_shock = shock_effects.get(f"{segment}_modifier", 1.0)
+                user_segments[segment]["proportion"] *= segment_shock
+            
+            # Renormalize proportions
+            total_proportion = sum(segment["proportion"] for segment in user_segments.values())
+            if total_proportion > 0:
+                for segment in user_segments:
+                    user_segments[segment]["proportion"] /= total_proportion
 
     return pd.DataFrame(monthly_results)
 
@@ -1352,7 +1888,7 @@ st.markdown("""
 
 with chart_container:
     # Header section with key metrics
-    st.markdown("### 📊 Token Performance Dashboard")
+    st.markdown("### Token Performance Dashboard")
     
     # Calculate metrics
     token_metrics = get_token_metrics(results)
@@ -1397,7 +1933,8 @@ with chart_container:
     with user_cols[3]:
         st.metric(
             "Market Penetration",
-            f"{(user_metrics['current_users'] / total_addressable_market * 100):.1f}%"
+            f"{(user_metrics['current_users'] / total_addressable_market * 100):.1f}%",
+            help="Percentage of the total addressable market currently using the platform"
         )
 
     # Enhanced Reserve Health Section
@@ -1412,7 +1949,8 @@ with chart_container:
     burn_metrics = calculate_monthly_burn_metrics(
         results['Reward Pool'].iloc[-1],
         reward_pool_size,
-        months
+        months,
+        results
     )
     
     # Display reserve metrics with enhanced visual feedback
@@ -1442,13 +1980,41 @@ with chart_container:
         )
     
     with reserve_cols[3]:
-        monthly_burn_formatted = format_number(burn_metrics['monthly_burn'])
+        if burn_metrics['monthly_burn'] > 0:
+            monthly_burn_formatted = format_number(burn_metrics['monthly_burn'])
+            burn_status = "🟢" if burn_metrics['is_sustainable'] else "🔴"
+            burn_text = f"{monthly_burn_formatted} {burn_status}"
+            burn_delta = f"-{burn_metrics['burn_rate_pct']:.1f}% of initial"
+        else:
+            monthly_growth_formatted = format_number(burn_metrics['monthly_growth'])
+            burn_text = f"+{monthly_growth_formatted} 🟢"
+            burn_delta = f"+{burn_metrics['growth_rate_pct']:.1f}% of initial"
+        
         st.metric(
-            "Monthly Burn Rate",
-            monthly_burn_formatted,
-            f"{burn_metrics['burn_rate_pct']:.1f}% of initial",
-            help="Average monthly reduction in reserve balance"
+            "Monthly Reserve Change",
+            burn_text,
+            burn_delta,
+            help=f"""
+            Average monthly change in reserve balance
+            Revenue/Burn Ratio: {burn_metrics['revenue_burn_ratio']:.2f}
+            Burn Sustainability: {burn_metrics['burn_sustainability']:.1f}%
+            """
         )
+    
+    # Update burn sustainability metrics
+    if burn_metrics['monthly_burn'] > 0 and not burn_metrics['is_sustainable']:
+        st.warning(f"""
+            🔥 **Current burn rate exceeds sustainable levels**
+            - Sustainable burn: {format_number(burn_metrics['sustainable_burn'])} tokens/month
+            - Current burn: {format_number(burn_metrics['monthly_burn'])} tokens/month
+            - Sustainability gap: {abs(burn_metrics['burn_sustainability']):.1f}%
+        """)
+    elif burn_metrics['monthly_growth'] > 0:
+        st.success(f"""
+            📈 **Reserve is growing**
+            - Monthly growth: {format_number(burn_metrics['monthly_growth'])} tokens/month
+            - Growth rate: {burn_metrics['growth_rate_pct']:.1f}% of initial reserve
+        """)
     
     # Add detailed burn analysis if in warning or critical state
     if status_text != "Healthy 🟢":
@@ -1510,7 +2076,7 @@ with chart_container:
     st.plotly_chart(reserve_trend, use_container_width=True)
 
     # Then continue with the "Detailed Analysis" section
-    st.markdown("### 📈 Detailed Analysis")
+    st.markdown("### Detailed Analysis")
     tabs = st.tabs(["Token Supply", "User Segments", "Market Metrics", "Raw Data"])
 
     with tabs[0]:
@@ -1569,91 +2135,55 @@ with chart_container:
         # Display the dataframe with highlighting only on numeric columns
         st.dataframe(highlight_numeric_max(display_df))
 
+    # --- Enhanced Reserve Health Metrics section ---
+
     # Calculate comprehensive reserve metrics
     reserve_metrics = calculate_reserve_metrics(results, reward_pool_size)
-    
+
     st.markdown("---")
-    st.markdown("### 📊 Reserve Health Metrics")
-    
-    # Display time in states
-    st.markdown("#### Time in Critical States")
-    state_cols = st.columns(3)
-    
-    with state_cols[0]:
+    st.markdown("### Reserve Health Metrics")
+
+    # Display key reserve metrics with modern styling
+    reserve_cols = st.columns(4)
+    with reserve_cols[0]:
         st.metric(
-            "Warning State",
-            f"{reserve_metrics['months_in_warning']} months",
-            f"{reserve_metrics['warning_percentage']:.1f}% of time",
-            help="Time spent between 25-50% of initial reserve"
+            label="Current Reserve",
+            value=format_currency(results['Reward Pool'].iloc[-1]),
+            delta=f"{((results['Reward Pool'].iloc[-1] - reward_pool_size)/reward_pool_size*100):.1f}%",
+            help="Current balance in the reward pool"
         )
-    
-    with state_cols[1]:
+
+    with reserve_cols[1]:
         st.metric(
-            "Critical State",
-            f"{reserve_metrics['months_in_critical']} months",
-            f"{reserve_metrics['critical_percentage']:.1f}% of time",
-            help="Time spent below 25% of initial reserve"
+            label="Initial Reserve",
+            value=format_currency(reward_pool_size),
+            help="Initial reward pool size"
         )
-    
-    with state_cols[2]:
+
+    with reserve_cols[2]:
         st.metric(
-            "Deficit State",
-            f"{reserve_metrics['months_in_deficit']} months",
-            f"{reserve_metrics['deficit_percentage']:.1f}% of time",
-            help="Time spent with negative reserves"
+            label="Minimum Reserve",
+            value=format_currency(results['Reward Pool'].min()),
+            delta=f"{(results['Reward Pool'].min()/reward_pool_size*100):.1f}% of initial",
+            help="Lowest reserve balance over time"
         )
-    
-    # Display deficit metrics if any exist
-    if reserve_metrics['months_in_deficit'] > 0:
-        st.markdown("#### Deficit Analysis")
-        deficit_cols = st.columns(2)
-        
-        with deficit_cols[0]:
-            st.metric(
-                "Cumulative Deficit",
-                format_number(reserve_metrics['cumulative_deficit']),
-                help="Total sum of negative reserves across all months"
-            )
-        
-        with deficit_cols[1]:
-            st.metric(
-                "Average Monthly Deficit",
-                format_number(
-                    reserve_metrics['cumulative_deficit'] / 
-                    reserve_metrics['months_in_deficit']
-                ) if reserve_metrics['months_in_deficit'] > 0 else "N/A",
-                help="Average deficit amount during negative months"
-            )
-    
-    # Display stability metrics
-    st.markdown("#### Reserve Stability")
-    stability_cols = st.columns(3)
-    
-    with stability_cols[0]:
+
+    with reserve_cols[3]:
+        # Reserve Health Status
+        health_status, ratio = calculate_reserve_health(
+            results['Reward Pool'].iloc[-1],
+            reward_pool_size
+        )
         st.metric(
-            "Reserve Volatility",
-            f"{reserve_metrics['reserve_volatility']:.1f}%",
-            help="Standard deviation of reserve levels relative to initial reserve"
+            label="Reserve Health",
+            value=health_status,
+            delta=f"{(ratio*100):.1f}% of initial",
+            help="Current reserve health status"
         )
-    
-    with stability_cols[1]:
-        st.metric(
-            "Recovery Count",
-            str(reserve_metrics['recovery_count']),
-            help="Number of times reserves recovered from critical to healthy levels"
-        )
-    
-    with stability_cols[2]:
-        st.metric(
-            "Minimum Reserve Ratio",
-            f"{(reserve_metrics['min_reserve_ratio'] * 100):.1f}%",
-            help="Lowest reserve level as percentage of initial reserve"
-        )
-    
-    # Add reserve state timeline
-    st.markdown("#### Reserve State Timeline")
-    
-    # Create state timeline data
+
+    # Create an enhanced reserve trend chart with shading for different reserve states
+
+    # Prepare data for chart
     timeline_data = results.copy()
     timeline_data['State'] = 'Healthy'
     timeline_data.loc[
@@ -1667,43 +2197,202 @@ with chart_container:
         'State'
     ] = 'Critical'
     timeline_data.loc[timeline_data['Reward Pool'] <= 0, 'State'] = 'Deficit'
-    
-    # Create timeline chart
-    timeline_chart = px.line(
-        timeline_data,
-        x='Month',
-        y='Reward Pool',
-        color='State',
-        title='Reserve Levels and States Over Time',
-        color_discrete_map={
-            'Healthy': '#00CC96',
-            'Warning': '#FFA15A',
-            'Critical': '#EF553B',
-            'Deficit': '#AB63FA'
-        }
+
+    # Create reserve trend chart with colored bands for different states
+    fig = go.Figure()
+
+    # Add Reward Pool line
+    fig.add_trace(go.Scatter(
+        x=timeline_data['Month'],
+        y=timeline_data['Reward Pool'],
+        mode='lines',
+        name='Reward Pool',
+        line=dict(color='#636EFA', width=3)
+    ))
+
+    # Add fill between lines to indicate states (using shapes for background colors)
+    # Create shapes for different reserve states
+    shapes = []
+
+    # Healthy
+    shapes.append(dict(
+        type='rect',
+        xref='x',
+        yref='y',
+        x0=timeline_data['Month'].min(),
+        y0=reserve_metrics['warning_threshold'],
+        x1=timeline_data['Month'].max(),
+        y1=timeline_data['Reward Pool'].max(),
+        fillcolor='rgba(0, 255, 0, 0.1)',  # Light green
+        layer='below',
+        line_width=0
+    ))
+
+    # Warning
+    shapes.append(dict(
+        type='rect',
+        xref='x',
+        yref='y',
+        x0=timeline_data['Month'].min(),
+        y0=reserve_metrics['critical_threshold'],
+        x1=timeline_data['Month'].max(),
+        y1=reserve_metrics['warning_threshold'],
+        fillcolor='rgba(255, 255, 0, 0.1)',  # Light yellow
+        layer='below',
+        line_width=0
+    ))
+
+    # Critical
+    shapes.append(dict(
+        type='rect',
+        xref='x',
+        yref='y',
+        x0=timeline_data['Month'].min(),
+        y0=0,
+        x1=timeline_data['Month'].max(),
+        y1=reserve_metrics['critical_threshold'],
+        fillcolor='rgba(255, 0, 0, 0.1)',  # Light red
+        layer='below',
+        line_width=0
+    ))
+
+    # Add shapes to layout
+    fig.update_layout(shapes=shapes)
+
+    # Update layout with modern styling
+    fig.update_layout(
+        title='Reward Pool Over Time with Reserve Health States',
+        xaxis_title='Month',
+        yaxis_title='Reward Pool',
+        hovermode='x unified',
+        template='plotly_white',
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1
+        ),
+        margin=dict(l=60, r=30, t=50, b=60),
+        font=dict(size=14),
+        yaxis=dict(
+            gridcolor='rgba(128,128,128,0.1)'
+        ),
+        xaxis=dict(
+            gridcolor='rgba(128,128,128,0.1)'
+        )
     )
-    
-    # Add threshold lines
-    timeline_chart.add_hline(
-        y=reserve_metrics['warning_threshold'],
-        line_dash="dash",
-        line_color="yellow",
-        annotation_text="Warning Threshold"
-    )
-    timeline_chart.add_hline(
-        y=reserve_metrics['critical_threshold'],
-        line_dash="dash",
-        line_color="red",
-        annotation_text="Critical Threshold"
-    )
-    timeline_chart.add_hline(
-        y=0,
-        line_dash="dash",
-        line_color="purple",
-        annotation_text="Deficit Threshold"
-    )
-    
-    st.plotly_chart(timeline_chart, use_container_width=True)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Add a summary of time spent in each state with modern UI
+    state_percentages = timeline_data['State'].value_counts(normalize=True)*100
+
+    st.markdown("#### Time Spent in Each Reserve State")
+    state_cols = st.columns(4)
+    with state_cols[0]:
+        st.metric(
+            label='Healthy',
+            value=f"{state_percentages.get('Healthy', 0):.1f}%",
+            help='Percentage of time reserve was in Healthy state'
+        )
+    with state_cols[1]:
+        st.metric(
+            label='Warning',
+            value=f"{state_percentages.get('Warning', 0):.1f}%",
+            help='Percentage of time reserve was in Warning state'
+        )
+    with state_cols[2]:
+        st.metric(
+            label='Critical',
+            value=f"{state_percentages.get('Critical', 0):.1f}%",
+            help='Percentage of time reserve was in Critical state'
+        )
+    with state_cols[3]:
+        st.metric(
+            label='Deficit',
+            value=f"{state_percentages.get('Deficit', 0):.1f}%",
+            help='Percentage of time reserve was in Deficit state'
+        )
+
+    # Add interactive elements for deeper insights
+    st.markdown("#### Interactive Insights")
+    st.markdown("Use the chart above to explore how the reserve levels have changed over time. Hover over the lines to see detailed data points.")
+
+    # Update the display section to show recovery metrics
+    def display_reserve_metrics(metrics, initial_reserve):
+        """Display enhanced reserve metrics including recovery events."""
+        st.markdown("### Reserve Health Metrics")
+        
+        cols = st.columns(4)
+        
+        with cols[0]:
+            st.metric(
+                "Recovery Events",
+                f"{metrics['recovery_count']}",
+                f"{metrics['recovery_strength']:.1f}% avg strength",
+                help="Number of times reserve recovered from warning/critical levels"
+            )
+        
+        with cols[1]:
+            time_in_warning = f"{metrics['warning_percentage']:.1f}%"
+            st.metric(
+                "Time in Warning",
+                time_in_warning,
+                f"{metrics['months_in_warning']} months",
+                help="Percentage of time reserve was below warning threshold"
+            )
+        
+        with cols[2]:
+            time_in_critical = f"{metrics['critical_percentage']:.1f}%"
+            st.metric(
+                "Time in Critical",
+                time_in_critical,
+                f"{metrics['months_in_critical']} months",
+                help="Percentage of time reserve was below critical threshold"
+            )
+        
+        with cols[3]:
+            # Calculate stability score based on state percentages
+            stability_score = 100 * (1 - (
+                metrics['warning_percentage'] + 
+                metrics['critical_percentage'] * 2 + 
+                metrics['deficit_percentage'] * 3
+            ) / 300)  # Weighted impact of different states
+            
+            # Determine trend based on recent state changes
+            if metrics['current_state'] == 'healthy' and metrics['consecutive_months_below'] == 0:
+                trend = "Stable"
+            elif metrics['consecutive_months_below'] > 0:
+                trend = "Declining"
+            else:
+                trend = "Recovering"
+            
+            # Set color based on stability score
+            stability_color = "🟢" if stability_score > 80 else "🟡" if stability_score > 60 else "🔴"
+            
+            st.metric(
+                "Reserve Stability",
+                f"{stability_score:.0f}/100 {stability_color}",
+                trend,
+                help=f"""
+                Reserve Stability Score (higher is better)
+                - Warning Time: {metrics['warning_percentage']:.1f}%
+                - Critical Time: {metrics['critical_percentage']:.1f}%
+                - Current State: {metrics['current_state']}
+                - Consecutive Months Below: {metrics['consecutive_months_below']}
+                """
+            )
+
+        # Add recovery event details if any exist
+        if metrics['recovery_events']:
+            st.markdown("#### Recovery Events")
+            for event in metrics['recovery_events']:
+                st.markdown(f"""
+                    - Month {event['month']}: Recovered from **{event['from_state']}** state
+                    - Duration: {event['duration']} months
+                    - Recovery Magnitude: {(event['recovery_magnitude'] * 100):.1f}%
+                """)
 
 # Add fullscreen modal HTML
 for chart_id in ['price', 'revenue', 'supply', 'users']:
@@ -2263,4 +2952,146 @@ def create_enhanced_plotly_chart(df, x, y, title, y_label):
         hovermode='x unified'
     )
     
-    return fig# Ensuring Git detects changes
+    return fig  # Ensuring Git detects changes
+
+# Create an enhanced token activity timeline chart
+def create_token_activity_chart(timeline_data, reserve_metrics):
+    """Create an enhanced token activity visualization with key metrics and thresholds."""
+    
+    # Create the main chart with multiple traces
+    fig = go.Figure()
+    
+    # Add reward pool with colored zones for different states
+    fig.add_trace(go.Scatter(
+        x=timeline_data['Month'],
+        y=timeline_data['Reward Pool'],
+        name='Reward Pool',
+        line=dict(color='#00CC96', width=2),
+        fill='tonexty',
+        fillcolor='rgba(0, 204, 150, 0.1)'
+    ))
+    
+    # Add token spending trend
+    fig.add_trace(go.Scatter(
+        x=timeline_data['Month'],
+        y=timeline_data['Tokens Spent'],
+        name='Tokens Spent',
+        line=dict(color='#EF553B', width=2)
+    ))
+    
+    # Add token earning trend
+    fig.add_trace(go.Scatter(
+        x=timeline_data['Month'],
+        y=timeline_data['Tokens Earned'],
+        name='Tokens Earned',
+        line=dict(color='#636EFA', width=2)
+    ))
+    
+    # Add dynamic threshold lines
+    fig.add_trace(go.Scatter(
+        x=timeline_data['Month'],
+        y=reserve_metrics['dynamic_thresholds']['warning_threshold'],
+        name='Warning Threshold',
+        line=dict(color='#FFA15A', dash='dash', width=1)
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=timeline_data['Month'],
+        y=reserve_metrics['dynamic_thresholds']['critical_threshold'],
+        name='Critical Threshold',
+        line=dict(color='#EF553B', dash='dash', width=1)
+    ))
+    
+    # Add recovery events as markers
+    if reserve_metrics['recovery_events']:
+        recovery_months = [event['month'] for event in reserve_metrics['recovery_events']]
+        recovery_values = [timeline_data['Reward Pool'].iloc[month] for month in recovery_months]
+        
+        fig.add_trace(go.Scatter(
+            x=recovery_months,
+            y=recovery_values,
+            mode='markers',
+            name='Recovery Events',
+            marker=dict(
+                symbol='star',
+                size=12,
+                color='#00CC96',
+                line=dict(width=2, color='white')
+            )
+        ))
+    
+    # Update layout with enhanced features
+    fig.update_layout(
+        title='Token Activity and Reserve Health',
+        yaxis_title='Tokens',
+        xaxis_title='Month',
+        hovermode='x unified',
+        showlegend=True,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01,
+            bgcolor='rgba(255, 255, 255, 0.1)'
+        ),
+        # Add annotations for key metrics
+        annotations=[
+            dict(
+                x=0.02,
+                y=1.05,
+                xref='paper',
+                yref='paper',
+                text=f'Stability Score: {reserve_metrics["stability_score"]:.0f}/100',
+                showarrow=False
+            ),
+            dict(
+                x=0.02,
+                y=1.02,
+                xref='paper',
+                yref='paper',
+                text=f'Recovery Events: {reserve_metrics["recovery_count"]}',
+                showarrow=False
+            )
+        ]
+    )
+    
+    # Add range selector for time window
+    fig.update_xaxes(
+        rangeslider_visible=True,
+        rangeselector=dict(
+            buttons=list([
+                dict(count=3, label="3m", step="month", stepmode="backward"),
+                dict(count=6, label="6m", step="month", stepmode="backward"),
+                dict(count=12, label="1y", step="month", stepmode="backward"),
+                dict(step="all", label="All")
+            ])
+        )
+    )
+    
+    return fig
+
+# Add metrics summary below chart
+with st.expander("📊 Token Activity Analysis"):
+    metrics_cols = st.columns(3)
+    
+    with metrics_cols[0]:
+        st.metric(
+            "Token Velocity",
+            f"{(timeline_data['Tokens Spent'].sum() / timeline_data['Tokens Earned'].sum()):.2f}x",
+            help="Rate at which tokens are being spent relative to earnings"
+        )
+    
+    with metrics_cols[1]:
+        st.metric(
+            "Net Token Balance",
+            format_number(timeline_data['Tokens Earned'].iloc[-1] - timeline_data['Tokens Spent'].iloc[-1]),
+            help="Current difference between total tokens earned and spent"
+        )
+    
+    with metrics_cols[2]:
+        burn_rate = (timeline_data['Tokens Burned'].diff() / timeline_data['Tokens Earned'].diff()).mean()
+        st.metric(
+            "Average Burn Rate",
+            f"{burn_rate:.1%}",
+            help="Average rate of token burning relative to earnings"
+        )
