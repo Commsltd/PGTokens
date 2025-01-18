@@ -4,6 +4,42 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
+from metrics_calculator import (
+    get_token_metrics,
+    get_user_metrics,
+    calculate_reserve_health,
+    calculate_monthly_burn_metrics
+)
+from tokenomics_optimizer import run_tokenomics_optimization
+from simulation import simulate_tokenomics
+
+# Must be the first Streamlit command
+st.set_page_config(
+    page_title="PG Tokenomics Simulator",
+    page_icon="🪙",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Initialize session state for debug logs
+if 'debug_logs' not in st.session_state:
+    st.session_state['debug_logs'] = []
+
+# Centralized logging function
+def log_message(message, debug_only=True):
+    """
+    Logs a message to the appropriate section based on the debug_only flag.
+    
+    Args:
+        message (str): The message to log.
+        debug_only (bool): If True, log only in the debugging section.
+    """
+    if debug_only:
+        # Store messages for debugging section
+        st.session_state['debug_logs'].append(message)
+    else:
+        # Display messages in the main UI
+        st.write(message)
 
 def get_token_metrics(results):
     """
@@ -335,8 +371,8 @@ def create_dual_axis_chart(df):
     fig = px.line(
         df, 
         x="Month", 
-        y="Token Price",
-        title="Token Price & Platform Revenue Over Time",
+        y="Reward Pool",
+        title="Platform Revenue & Treasury Reserve Over Time",
         template="plotly_dark",
         width=800,
         height=450
@@ -354,7 +390,7 @@ def create_dual_axis_chart(df):
     # Update layout for dual axes
     fig.update_layout(
         title=dict(
-            text="Token Price & Platform Revenue Over Time",
+            text="Platform Revenue & Treasury Reserve Over Time",
             x=0.5,
             y=0.95,
             font=dict(size=20),
@@ -362,8 +398,8 @@ def create_dual_axis_chart(df):
             yanchor='top'
         ),
         yaxis=dict(
-            title="Token Price ($)",
-            titlefont=dict(color="#636EFA"),  # Blue color for token price
+            title="Treasury Reserve (Tokens)",
+            titlefont=dict(color="#636EFA"),  # Blue color for reserve
             tickfont=dict(color="#636EFA"),
             gridcolor='rgba(128,128,128,0.1)',
             zerolinecolor='rgba(128,128,128,0.1)'
@@ -1364,7 +1400,6 @@ def simulate_tokenomics(
     return pd.DataFrame(monthly_results)
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="PG Tokenomics Simulator", layout="wide")
 st.title("PG Tokenomics Simulator")
 
 # Add at the beginning of your sidebar parameters, before other user metrics
@@ -1551,7 +1586,7 @@ staking_apr = create_slider_with_range(
 
 reward_pool_size = st.sidebar.number_input("Initial Reward Pool Size", value=1000000)
 
-# --- Section 3:  Platform Activity Parameters ---
+# --- Section 3: Platform Activity Parameters ---
 
 st.sidebar.header("3. Platform Activity Parameters")
 
@@ -1565,6 +1600,9 @@ line_items_per_customer = create_slider_with_range(
     help_text="Monthly line items per customer (recommended: 50-100)."
 )
 
+# Log the captured line items per customer
+log_message(f"Captured Line Items per Customer: {line_items_per_customer}", debug_only=True)
+
 contribution_cap = create_slider_with_range(
     "Contribution Cap (Line Items per User per Month)",
     1,
@@ -1574,6 +1612,9 @@ contribution_cap = create_slider_with_range(
     key_prefix="s3",
     help_text="Maximum monthly contributions per user (recommended: 500-1000)."
 )
+
+# Log the captured contribution cap
+log_message(f"Captured Contribution Cap: {contribution_cap}", debug_only=True)
 
 initial_lookup_frequency = create_slider_with_range(
     "Initial Lookups per Customer per Year",
@@ -1585,6 +1626,9 @@ initial_lookup_frequency = create_slider_with_range(
     help_text="Annual customer lookup frequency (recommended: 6-12)."
 )
 
+# Log the captured initial lookup frequency
+log_message(f"Captured Initial Lookups per Customer per Year: {initial_lookup_frequency}", debug_only=True)
+
 initial_premium_adoption = create_slider_with_range(
     "Initial Premium Adoption Rate (% of Users)",
     0.00,
@@ -1594,6 +1638,9 @@ initial_premium_adoption = create_slider_with_range(
     key_prefix="s3",
     help_text="Starting premium feature adoption rate (recommended: 20-30%)."
 )
+
+# Log the captured initial premium adoption rate
+log_message(f"Captured Initial Premium Adoption Rate: {initial_premium_adoption}", debug_only=True)
 
 customers_per_user = create_slider_with_range(
     "Customers per User",
@@ -1605,6 +1652,9 @@ customers_per_user = create_slider_with_range(
     help_text="The average number of customers associated with each user.",
 )
 
+# Log the captured customers per user
+log_message(f"Captured Customers per User: {customers_per_user}", debug_only=True)
+
 new_customers_per_user = create_slider_with_range(
     "New Customers per User (per month)",
     1,
@@ -1615,6 +1665,9 @@ new_customers_per_user = create_slider_with_range(
     help_text="Average new customers acquired per user monthly (recommended: 5-10)."
 )
 
+# Log the captured new customers per user
+log_message(f"Captured New Customers per User: {new_customers_per_user}", debug_only=True)
+
 initial_search_fee = create_slider_with_range(
     "Initial Search Fee (Tokens)",
     0.1,
@@ -1624,6 +1677,9 @@ initial_search_fee = create_slider_with_range(
     key_prefix="s3",
     help_text="The initial number of tokens required to perform a search.",
 )
+
+# Log the captured initial search fee
+log_message(f"Captured Initial Search Fee: {initial_search_fee}", debug_only=True)
 
 transaction_fee_rate = create_slider_with_range(
     "Transaction Fee Rate (%)",
@@ -1636,6 +1692,9 @@ transaction_fee_rate = create_slider_with_range(
     help_text="Fee percentage per transaction (recommended: 3-5%)."
 )
 
+# Log the captured transaction fee rate
+log_message(f"Captured Transaction Fee Rate: {transaction_fee_rate}", debug_only=True)
+
 # Add sliders for token purchase parameters
 token_purchase_threshold = create_slider_with_range(
     "Token Purchase Threshold (Tokens)",
@@ -1647,6 +1706,9 @@ token_purchase_threshold = create_slider_with_range(
     help_text="Token balance triggering purchases (recommended: 5-10)."
 )
 
+# Log the captured token purchase threshold
+log_message(f"Captured Token Purchase Threshold: {token_purchase_threshold}", debug_only=True)
+
 token_purchase_amount = create_slider_with_range(
     "Token Purchase Amount (Tokens)",
     1.0,
@@ -1657,6 +1719,9 @@ token_purchase_amount = create_slider_with_range(
     help_text="Tokens purchased when below threshold (recommended: 10-20)."
 )
 
+# Log the captured token purchase amount
+log_message(f"Captured Token Purchase Amount: {token_purchase_amount}", debug_only=True)
+
 token_sale_price = create_slider_with_range(
     "Token Sale Price ($ per Token)",
     0.01,
@@ -1666,6 +1731,9 @@ token_sale_price = create_slider_with_range(
     key_prefix="s3",
     help_text="The price at which tokens are sold to users."
 )
+
+# Log the captured token sale price
+log_message(f"Captured Token Sale Price: {token_sale_price}", debug_only=True)
 
 # --- Section 4: Market Parameters ---
 st.sidebar.header("4. Market Parameters")
@@ -1680,6 +1748,9 @@ initial_token_price = create_slider_with_range(
     help_text="The starting price of the token in USD."
 )
 
+# Log the captured initial token price
+log_message(f"Captured Initial Token Price: {initial_token_price}", debug_only=True)
+
 price_elasticity = create_slider_with_range(
     "Price Elasticity",
     0.1,
@@ -1690,6 +1761,9 @@ price_elasticity = create_slider_with_range(
     help_text="Token price sensitivity to supply/demand (recommended: 0.3-0.5)."
 )
 
+# Log the captured price elasticity
+log_message(f"Captured Price Elasticity: {price_elasticity}", debug_only=True)
+
 initial_market_sentiment = create_slider_with_range(
     "Initial Market Sentiment",
     0.5,
@@ -1699,6 +1773,9 @@ initial_market_sentiment = create_slider_with_range(
     key_prefix="s4",
     help_text="Starting market sentiment (1.0 is neutral)."
 )
+
+# Log the captured initial market sentiment
+log_message(f"Captured Initial Market Sentiment: {initial_market_sentiment}", debug_only=True)
 
 market_volatility = create_slider_with_range(
     "Market Volatility",
@@ -1711,6 +1788,9 @@ market_volatility = create_slider_with_range(
     help_text="Market sentiment volatility (recommended: 0.1-0.2)."
 )
 
+# Log the captured market volatility
+log_message(f"Captured Market Volatility: {market_volatility}", debug_only=True)
+
 market_trend = create_slider_with_range(
     "Market Trend",
     -0.1,
@@ -1721,13 +1801,23 @@ market_trend = create_slider_with_range(
     help_text="Long-term market sentiment trend (0.0 is neutral)."
 )
 
+# Log the captured market trend
+log_message(f"Captured Market Trend: {market_trend}", debug_only=True)
+
 # --- Competition Parameters ---
 num_competitors = st.sidebar.number_input("Number of Competitors", 0, 10, 3)
+log_message(f"Captured Number of Competitors: {num_competitors}", debug_only=True)
+
 competitor_growth_rates = [0.04] * num_competitors  # Default 4% growth
 competitor_attractiveness = [0.02] * num_competitors  # Default 0.02 attractiveness
 
+# Log the captured competitor growth rates and attractiveness
+log_message(f"Captured Competitor Growth Rates: {competitor_growth_rates}", debug_only=True)
+log_message(f"Captured Competitor Attractiveness: {competitor_attractiveness}", debug_only=True)
+
 # --- Simulation Parameters ---
 months = st.sidebar.number_input("Simulation Duration (Months)", 12, 120, 36)
+log_message(f"Captured Simulation Duration: {months}", debug_only=True)
 
 # Temporarily disable shock events for testing
 shock_events = None
@@ -1776,115 +1866,65 @@ results = simulate_tokenomics(
     }
 )
 
+# --- Main Dashboard ---
+st.markdown("## Platform Performance Dashboard")
+
+# Revenue Section (First and Most Prominent)
+st.markdown("### Revenue Metrics")
+revenue_cols = st.columns(4)
+
+with revenue_cols[0]:
+    current_revenue = results['Platform Revenue ($)'].iloc[-1]
+    prev_revenue = results['Platform Revenue ($)'].iloc[-2]
+    revenue_growth = ((current_revenue / prev_revenue) - 1) * 100 if prev_revenue > 0 else 0
+    st.metric(
+        "Current Monthly Revenue",
+        format_currency(current_revenue),
+        f"{revenue_growth:.1f}% MoM",
+        help="Latest monthly platform revenue"
+    )
+
+with revenue_cols[1]:
+    total_revenue = results['Platform Revenue ($)'].sum()
+    avg_monthly_revenue = total_revenue / len(results)
+    st.metric(
+        "Total Revenue",
+        format_currency(total_revenue),
+        f"Avg {format_currency(avg_monthly_revenue)}/mo",
+        help="Cumulative platform revenue since launch"
+    )
+
+with revenue_cols[2]:
+    avg_revenue_per_user = current_revenue / results['Users'].iloc[-1]
+    st.metric(
+        "Revenue per User",
+        format_currency(avg_revenue_per_user),
+        help="Average monthly revenue per active user"
+    )
+
+with revenue_cols[3]:
+    premium_revenue = results['Premium Spending'].iloc[-1] * results['Token Price'].iloc[-1]
+    search_revenue = results['Search Spending'].iloc[-1] * results['Token Price'].iloc[-1]
+    total_monthly_revenue = premium_revenue + search_revenue
+    premium_pct = (premium_revenue / total_monthly_revenue * 100) if total_monthly_revenue > 0 else 0
+    search_pct = (search_revenue / total_monthly_revenue * 100) if total_monthly_revenue > 0 else 0
+    st.metric(
+        "Premium/Search Split",
+        f"{premium_pct:.1f}% / {search_pct:.1f}%",
+        help="Revenue split between premium subscriptions and search fees"
+    )
+
+# Revenue Trend Chart
+st.markdown("#### Revenue Growth Trend")
+revenue_fig = create_dual_axis_chart(results)
+st.plotly_chart(revenue_fig, use_container_width=True)
+
+st.markdown("---")
+
+# Continue with rest of the dashboard (Token Performance, etc.)
+
 # --- Create a container for the floating charts ---
 chart_container = st.container()
-
-# Add custom CSS for modern styling and full-screen modal
-st.markdown("""
-    <style>
-    /* Modern card styling */
-    div.stContainer {
-        background: linear-gradient(135deg, #f0f2f6, #e0e5ec);
-        border-radius: 10px;
-        padding: 1rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    
-    /* Chart container styling */
-    .chart-container {
-        background: linear-gradient(135deg, #ffffff, #f0f2f6);
-        border-radius: 12px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-        box-shadow: 0 8px 12px rgba(0, 0, 0, 0.1);
-        transition: box-shadow 0.3s ease;
-    }
-    
-    .chart-container:hover {
-        box-shadow: 0 12px 16px rgba(0, 0, 0, 0.2);
-    }
-    
-    /* Button styling */
-    .stButton>button {
-        color: #ffffff !important;
-        background-color: #1f77b4 !important;
-        border: none !important;
-        border-radius: 8px;
-        padding: 0.5rem 1rem;
-        transition: background-color 0.3s ease;
-    }
-    
-    .stButton>button:hover {
-        background-color: #135c8d !important;
-    }
-    
-    /* Improve text readability */
-    .chart-title {
-        color: #111;
-        font-size: 1.2rem;
-        font-weight: 600;
-        margin-bottom: 0.5rem;
-    }
-    
-    /* Ensure axis labels are visible */
-    .matplotlib-figure text {
-        fill: #111 !important;
-        font-size: 10pt !important;
-    }
-    
-    /* Ensure the plots fill their containers */
-    .stPlot {
-        width: 100% !important;
-    }
-    
-    /* Fullscreen modal styling */
-    .fullscreen-modal {
-        display: none; /* Hide by default */
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background-color: rgba(0, 0, 0, 0.8);
-        z-index: 1000;
-        justify-content: center;
-        align-items: center;
-    }
-
-    .modal-content {
-        background-color: #fff;
-        padding: 20px;
-        border-radius: 8px;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-        position: relative;
-    }
-
-    .close-button {
-        position: absolute;
-        top: 10px;
-        right: 10px;
-        font-size: 24px;
-        color: #333;
-        cursor: pointer;
-    }
-
-    .close-button:hover {
-        color: #000;
-    }
-    </style>
-    
-    <script>
-    function openFullscreen(chartId) {
-        const modal = document.getElementById('modal-' + chartId);
-        modal.style.display = 'flex';
-    }
-    
-    function closeFullscreen(chartId) {
-        const modal = document.getElementById('modal-' + chartId);
-        modal.style.display = 'none';
-    }
-    </script>
-    """, unsafe_allow_html=True)
 
 with chart_container:
     # Header section with key metrics
@@ -2393,17 +2433,6 @@ with chart_container:
                     - Duration: {event['duration']} months
                     - Recovery Magnitude: {(event['recovery_magnitude'] * 100):.1f}%
                 """)
-
-# Add fullscreen modal HTML
-for chart_id in ['price', 'revenue', 'supply', 'users']:
-    st.markdown(f"""
-        <div id="modal-{chart_id}" class="fullscreen-modal">
-            <div class="modal-content">
-                <span class="close-button" onclick="closeFullscreen('{chart_id}')">&times;</span>
-                <div id="fullscreen-chart-{chart_id}"></div>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
 
 def analyze_reserve_depletion(results, initial_reserve):
     """
@@ -3095,3 +3124,160 @@ with st.expander("📊 Token Activity Analysis"):
             f"{burn_rate:.1%}",
             help="Average rate of token burning relative to earnings"
         )
+
+# --- Debugging Section ---
+with st.expander("🔍 Debugging & Logging Information"):
+    st.write("### Input Parameters")
+    st.write(f"User Growth Rate: {growth_rate}")
+    st.write(f"Inactivity Rate: {inactivity_rate}")
+    st.write(f"Initial User Base: {base_users}")
+    st.write(f"Initial Reward: {initial_reward}")
+    st.write(f"Reward Decay Rate: {reward_decay_rate}")
+    st.write(f"Burn Rate: {burn_rate}")
+    st.write(f"Staking APR: {staking_apr}")
+    st.write(f"Initial Reward Pool Size: {reward_pool_size}")
+    st.write(f"Line Items per Customer: {line_items_per_customer}")
+    st.write(f"Contribution Cap: {contribution_cap}")
+    st.write(f"Initial Lookups per Customer per Year: {initial_lookup_frequency}")
+    st.write(f"Initial Premium Adoption Rate: {initial_premium_adoption}")
+    st.write(f"Customers per User: {customers_per_user}")
+    st.write(f"New Customers per User: {new_customers_per_user}")
+    st.write(f"Initial Search Fee: {initial_search_fee}")
+    st.write(f"Transaction Fee Rate: {transaction_fee_rate}")
+    st.write(f"Token Purchase Threshold: {token_purchase_threshold}")
+    st.write(f"Token Purchase Amount: {token_purchase_amount}")
+    st.write(f"Token Sale Price: {token_sale_price}")
+    st.write(f"Initial Token Price: {initial_token_price}")
+    st.write(f"Price Elasticity: {price_elasticity}")
+    st.write(f"Initial Market Sentiment: {initial_market_sentiment}")
+    st.write(f"Market Volatility: {market_volatility}")
+    st.write(f"Market Trend: {market_trend}")
+    st.write(f"Number of Competitors: {num_competitors}")
+    st.write(f"Competitor Growth Rates: {competitor_growth_rates}")
+    st.write(f"Competitor Attractiveness: {competitor_attractiveness}")
+    st.write(f"Simulation Duration: {months}")
+    
+    st.write("### Simulation Results")
+    st.write(results.head())
+    
+    st.write("### Metrics")
+    st.write(f"Reserve Health Status: {status_text}, Ratio: {ratio}")
+    st.write(f"Burn Metrics: {burn_metrics}")
+
+    st.write("### Debug Logs")
+    for log in st.session_state['debug_logs']:
+        st.write(log)
+
+# --- Optimization Section ---
+with st.expander("🎯 Optimization Panel", expanded=False):
+    # Set Optimization Objectives
+    st.write("#### Set Optimization Objectives")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        optimize_objectives = {
+            'token_price': st.checkbox('Maximize Token Price', value=True),
+            'user_growth': st.checkbox('Maximize User Growth', value=True),
+            'reserve_health': st.checkbox('Maximize Reserve Health', value=True),
+            'token_velocity': st.checkbox('Optimize Token Velocity', value=False)
+        }
+    
+    with col2:
+        objective_weights = {
+            'token_price': st.slider('Token Price Weight', 0.0, 1.0, 0.3),
+            'user_growth': st.slider('User Growth Weight', 0.0, 1.0, 0.3),
+            'reserve_health': st.slider('Reserve Health Weight', 0.0, 1.0, 0.2),
+            'token_velocity': st.slider('Token Velocity Weight', 0.0, 1.0, 0.2)
+        }
+
+    # Optimization Parameters
+    st.write("#### Set Optimization Parameters")
+    col3, col4 = st.columns(2)
+    
+    with col3:
+        num_iterations = st.number_input('Number of Iterations', 10, 1000, 100)
+        population_size = st.number_input('Population Size', 10, 200, 50)
+    
+    with col4:
+        mutation_rate = st.slider('Mutation Rate', 0.01, 0.5, 0.1)
+        convergence_threshold = st.slider('Convergence Threshold', 0.001, 0.1, 0.01)
+    
+    # Run Optimization
+    if st.button('Run Optimization'):
+        with st.spinner('Running optimization...'):
+            try:
+                optimization_results = run_tokenomics_optimization(
+                    current_params={
+                        'token_price': initial_token_price,
+                        'burn_rate': burn_rate,
+                        'reward_decay_rate': reward_decay_rate,
+                        'staking_apr': staking_apr,
+                        'transaction_fee_rate': transaction_fee_rate
+                    },
+                    objectives=optimize_objectives,
+                    weights=objective_weights,
+                    num_iterations=num_iterations,
+                    population_size=population_size,
+                    mutation_rate=mutation_rate,
+                    convergence_threshold=convergence_threshold,
+                    simulation_params={
+                        'initial_reward': initial_reward,
+                        'initial_search_fee': initial_search_fee,
+                        'growth_rate': growth_rate,
+                        'line_items_per_customer': line_items_per_customer,
+                        'initial_lookup_frequency': initial_lookup_frequency,
+                        'contribution_cap': contribution_cap,
+                        'initial_premium_adoption': initial_premium_adoption,
+                        'inactivity_rate': inactivity_rate,
+                        'months': months,
+                        'base_users': base_users,
+                        'customers_per_user': customers_per_user,
+                        'new_customers_per_user': new_customers_per_user,
+                        'price_elasticity': price_elasticity,
+                        'initial_market_sentiment': initial_market_sentiment,
+                        'market_volatility': market_volatility,
+                        'market_trend': market_trend,
+                        'reward_pool_size': reward_pool_size,
+                        'num_competitors': num_competitors,
+                        'competitor_growth_rates': competitor_growth_rates,
+                        'competitor_attractiveness': competitor_attractiveness,
+                        'token_purchase_threshold': token_purchase_threshold,
+                        'token_purchase_amount': token_purchase_amount,
+                        'token_sale_price': token_sale_price,
+                        'total_users_target': total_users_target,
+                        'total_addressable_market': total_addressable_market,
+                        'logistic_enabled': True,
+                        'carrying_capacity': total_addressable_market,
+                        'growth_steepness': 0.25,
+                        'midpoint_month': 12,
+                        'total_vested_tokens': 100_000,
+                        'vest_duration': 12
+                    }
+                )
+                
+                st.success('Optimization complete!')
+                
+                # Display optimization results
+                st.write("### Optimization Results")
+                st.write("#### Recommended Parameters:")
+                for param, value in optimization_results['recommended_params'].items():
+                    st.metric(
+                        label=param.replace('_', ' ').title(),
+                        value=f"{value:.4f}"
+                    )
+                
+                st.write("#### Performance Metrics:")
+                st.line_chart(optimization_results['convergence_history'])
+                
+                st.write("### Detailed Analysis")
+                tab1, tab2 = st.tabs(["Parameter Sensitivity", "Trade-offs"])
+                
+                with tab1:
+                    st.write("#### Parameter Sensitivity Analysis")
+                    st.write(optimization_results['sensitivity_analysis'])
+                
+                with tab2:
+                    st.write("#### Trade-off Analysis")
+                    st.write(optimization_results['trade_offs'])
+            except Exception as e:
+                st.error(f"An error occurred during optimization: {e}")
