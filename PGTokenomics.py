@@ -4,12 +4,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
-from metrics_calculator import (
-    get_token_metrics,
-    get_user_metrics,
-    calculate_reserve_health,
-    calculate_monthly_burn_metrics
-)
 from tokenomics_optimizer import run_tokenomics_optimization
 from simulation import simulate_tokenomics
 
@@ -372,7 +366,7 @@ def create_dual_axis_chart(df):
         df, 
         x="Month", 
         y="Reward Pool",
-        title="Platform Revenue & Treasury Reserve Over Time",
+        title="Platform Revenue & Treasury Tokens Over Time",
         template="plotly_dark",
         width=800,
         height=450
@@ -390,7 +384,7 @@ def create_dual_axis_chart(df):
     # Update layout for dual axes
     fig.update_layout(
         title=dict(
-            text="Platform Revenue & Treasury Reserve Over Time",
+            text="Platform Revenue & Treasury Tokens Over Time",
             x=0.5,
             y=0.95,
             font=dict(size=20),
@@ -398,8 +392,8 @@ def create_dual_axis_chart(df):
             yanchor='top'
         ),
         yaxis=dict(
-            title="Treasury Reserve (Tokens)",
-            titlefont=dict(color="#636EFA"),  # Blue color for reserve
+            title="Treasury Tokens",
+            titlefont=dict(color="#636EFA"),  # Blue color for treasury
             tickfont=dict(color="#636EFA"),
             gridcolor='rgba(128,128,128,0.1)',
             zerolinecolor='rgba(128,128,128,0.1)'
@@ -811,6 +805,8 @@ def simulate_tokenomics(
     competitor_growth_rates,
     competitor_attractiveness,
     transaction_fee_rate,
+    reward_pool_share,
+    burn_share,
     token_purchase_threshold,
     token_purchase_amount,
     token_sale_price,
@@ -830,7 +826,6 @@ def simulate_tokenomics(
 
     # Ensure targets don't exceed TAM
     total_users_target = min(total_users_target, total_addressable_market)
-    base_users = max(1000, int(total_users_target * 0.1))
     
     # Calculate maximum possible growth rate based on TAM
     max_growth_rate = (total_addressable_market / base_users) ** (1/months) - 1
@@ -913,7 +908,15 @@ def simulate_tokenomics(
     previous_price = initial_token_price
     previous_transaction_volume = 0
     price_history = []
-
+    
+    # Initialize revenue tracking
+    fiat_transaction_revenue = 0
+    fiat_premium_revenue = 0
+    token_transaction_revenue = 0
+    token_premium_revenue = 0
+    token_search_revenue = 0
+    treasury_tokens = 0  # Track platform's treasury tokens
+    
     # Initialize enhanced shock tracking
     shock_effects = {
         "sentiment_persistence": 0,
@@ -1016,8 +1019,28 @@ def simulate_tokenomics(
             effective_growth = effective_growth_rate * saturation_factor
             new_users = int(users * effective_growth)
 
-        # Enhanced competition and churn effects
+        # Adjust revenue calculations
+        # Scale revenue by market penetration factor
+        market_penetration_factor = users / total_addressable_market
+        platform_revenue *= market_penetration_factor
+
+        # Implement dynamic churn rates
         base_churn = np.clip(inactivity_rate * (1 + market_saturation), 0.03, 0.12)
+        if effective_growth_rate > 0.1:  # If growth rate is high
+            base_churn *= 1.5  # Increase churn to balance growth
+
+        # Ensure competitor impacts are realistic
+        competitor_impact = 1.0
+        for i in range(num_competitors):
+            competitor_growth = competitor_growth_rates[i] if isinstance(competitor_growth_rates, list) else competitor_growth_rates
+            competitor_attract = competitor_attractiveness[i] if isinstance(competitor_attractiveness, list) else competitor_attractiveness
+            competitor_strength = competitor_attract * (1 + competitor_growth)
+            competitor_impact *= (1 - competitor_strength)
+
+        # Apply competitor impact to growth
+        effective_growth = effective_growth_rate * competitor_impact
+
+        # Enhanced competition and churn effects
         churned_users = int(users * base_churn)
 
         # Calculate competitor effects with market saturation
@@ -1194,13 +1217,34 @@ def simulate_tokenomics(
         
         # Convert fees to revenue based on token price
         transaction_revenue = base_transaction_fees * token_price
-        platform_revenue += transaction_revenue
+        fiat_transaction_revenue = transaction_revenue
+        
+        # Calculate fiat revenue from monthly spending
+        monthly_fiat_revenue = monthly_spending * token_price * 0.75
+        fiat_premium_revenue = monthly_fiat_revenue
+        
+        # Update platform revenue
+        platform_revenue = fiat_transaction_revenue + fiat_premium_revenue
 
-        # Calculate token distribution from revenue
-        tokens_from_revenue = transaction_revenue / token_price  # Convert revenue to tokens
-        reward_pool_share = tokens_from_revenue * 0.5  # 50% to reward pool
-        burn_share = tokens_from_revenue * 0.25  # 25% to burning
-        reserve_share = tokens_from_revenue * 0.25  # 25% to reserve
+        # Calculate token revenue streams
+        search_spending = monthly_spending  # From search fees
+        premium_spending_total = premium_spending  # From premium features
+        
+        # Update treasury with received tokens
+        token_search_revenue = search_spending
+        token_premium_revenue = premium_spending_total
+        treasury_tokens += (token_search_revenue + token_premium_revenue)
+
+        # Calculate potential fiat value (not actual revenue, just for reference)
+        potential_fiat_value = (search_spending + premium_spending_total) * token_price
+        
+        # Update the monthly results to show all revenue streams:
+        monthly_results[-1].update({
+            "Potential Fiat Value ($)": potential_fiat_value,
+            "Token Search Revenue": token_search_revenue,
+            "Token Premium Revenue": token_premium_revenue,
+            "Treasury Tokens": treasury_tokens,
+        })
 
         # 7. Reward Pool Management
         # Calculate base rewards per user based on activity
@@ -1407,12 +1451,14 @@ st.sidebar.header("🎯 Market Size Parameters")
 
 # Total Addressable Market (TAM) with slider
 total_addressable_market = st.sidebar.number_input(
-    "Total Addressable Market (Users)",
-    min_value=10_000,
-    max_value=1_000_000_000,
-    value=1_000_000,
-    help="The maximum possible number of users for your platform"
+    "Total Addressable Market",
+    min_value=1000,
+    max_value=10000000,
+    value=1000000,
+    step=1000,
+    help="Total potential users in the market"
 )
+log_message(f"TAM set to: {total_addressable_market}", debug_only=True)
 
 # Format the display
 formatted_tam = format_number(total_addressable_market)
@@ -1433,9 +1479,15 @@ total_users_target = create_slider_with_range(
     help_text="Your target number of users (cannot exceed Total Addressable Market)"
 )
 
-# Show percentage of TAM
+# Calculate and display target percentage
 target_percentage = (total_users_target / total_addressable_market) * 100
-st.sidebar.markdown(f"Target represents **{target_percentage:.1f}%** of total market")
+st.sidebar.markdown(
+    f"""
+    Target User Growth:
+    - Current Target: **{format_number(total_users_target)} users**
+    - Represents **{target_percentage:.1f}%** of Total Addressable Market ({format_number(total_addressable_market)} users)
+    """
+)
 
 # --- Sidebar for Custom Slider Ranges ---
 st.sidebar.title("Customize Slider Ranges")
@@ -1502,17 +1554,18 @@ def calculate_user_growth(users, growth_rate, smoothing_factor=0.1):
     new_users = int(users * adjusted_growth_rate)
     return new_users
 
-# User Growth Rate Slider
+# User Growth Rate Slider with min/max boxes
 growth_rate = create_slider_with_range(
-    "User Growth Rate (%)",
-    0.00,
-    20.00,
-    6.00,  # Default 6% monthly growth
-    0.01,
-    format="%.2f",
-    key_prefix="s1",
-    help_text="The percentage by which the user base grows each month (recommended: 5-7%)."
+    "User Growth Rate (%/month)",
+    default_min=0.0,
+    default_max=20.0,
+    default_value=6.0,
+    step=0.1,
+    format="%.1f",
+    key_prefix="growth_rate",
+    help_text="Monthly user growth rate as a percentage"
 )
+log_message(f"UI Input - Growth Rate: {growth_rate}%", debug_only=True)
 
 # Inactivity Rate Slider
 inactivity_rate = create_slider_with_range(
@@ -1539,6 +1592,26 @@ base_users = create_slider_with_range(
 
 # --- Section 2: Token & Reward Parameters ---
 st.sidebar.header("2. Token & Reward Parameters")
+
+reward_pool_share = create_slider_with_range(
+    "Reward Pool Share (%)",
+    0.0,
+    100.0,
+    20.0,  # Default 20%
+    1.0,
+    key_prefix="s2",
+    help_text="Percentage of revenue allocated to reward pool (recommended: 15-25%)."
+)
+
+burn_share = create_slider_with_range(
+    "Burn Share (%)",
+    0.0,
+    100.0,
+    10.0,  # Default 10%
+    1.0,
+    key_prefix="s2",
+    help_text="Percentage of revenue allocated to token burning (recommended: 5-15%)."
+)
 
 initial_reward = create_slider_with_range(
     "Initial Reward per Line Item (Tokens)",
@@ -1590,6 +1663,46 @@ reward_pool_size = st.sidebar.number_input("Initial Reward Pool Size", value=100
 
 st.sidebar.header("3. Platform Activity Parameters")
 
+contribution_cap = create_slider_with_range(
+    "Contribution Cap",
+    100,
+    5000,
+    750,  # Default 750
+    50,
+    key_prefix="s3",
+    help_text="Maximum number of contributions allowed per user (recommended: 500-1000)."
+)
+
+transaction_fee_rate = create_slider_with_range(
+    "Transaction Fee Rate (%)",
+    0.0,
+    10.0,
+    4.0,  # Default 4%
+    0.1,
+    key_prefix="s3",
+    help_text="Percentage fee charged on token transactions (recommended: 3-5%)."
+)
+
+customers_per_user = create_slider_with_range(
+    "Customers per User",
+    1,
+    100,
+    50,  # Default 50
+    1,
+    key_prefix="s3",
+    help_text="Average number of customers each user manages."
+)
+
+new_customers_per_user = create_slider_with_range(
+    "New Customers per User (Monthly)",
+    1,
+    20,
+    7,  # Default 7
+    1,
+    key_prefix="s3",
+    help_text="Average number of new customers each user adds per month."
+)
+
 line_items_per_customer = create_slider_with_range(
     "Line Items per Customer",
     1,
@@ -1599,74 +1712,6 @@ line_items_per_customer = create_slider_with_range(
     key_prefix="s3",
     help_text="Monthly line items per customer (recommended: 50-100)."
 )
-
-# Log the captured line items per customer
-log_message(f"Captured Line Items per Customer: {line_items_per_customer}", debug_only=True)
-
-contribution_cap = create_slider_with_range(
-    "Contribution Cap (Line Items per User per Month)",
-    1,
-    10000,
-    750,  # Default 750 items
-    1,
-    key_prefix="s3",
-    help_text="Maximum monthly contributions per user (recommended: 500-1000)."
-)
-
-# Log the captured contribution cap
-log_message(f"Captured Contribution Cap: {contribution_cap}", debug_only=True)
-
-initial_lookup_frequency = create_slider_with_range(
-    "Initial Lookups per Customer per Year",
-    1,
-    100,
-    9,  # Default 9 lookups
-    1,
-    key_prefix="s3",
-    help_text="Annual customer lookup frequency (recommended: 6-12)."
-)
-
-# Log the captured initial lookup frequency
-log_message(f"Captured Initial Lookups per Customer per Year: {initial_lookup_frequency}", debug_only=True)
-
-initial_premium_adoption = create_slider_with_range(
-    "Initial Premium Adoption Rate (% of Users)",
-    0.00,
-    1.00,
-    0.25,  # Default 25%
-    0.01,
-    key_prefix="s3",
-    help_text="Starting premium feature adoption rate (recommended: 20-30%)."
-)
-
-# Log the captured initial premium adoption rate
-log_message(f"Captured Initial Premium Adoption Rate: {initial_premium_adoption}", debug_only=True)
-
-customers_per_user = create_slider_with_range(
-    "Customers per User",
-    1,
-    1000,
-    50,
-    1,
-    key_prefix="s3",
-    help_text="The average number of customers associated with each user.",
-)
-
-# Log the captured customers per user
-log_message(f"Captured Customers per User: {customers_per_user}", debug_only=True)
-
-new_customers_per_user = create_slider_with_range(
-    "New Customers per User (per month)",
-    1,
-    100,
-    7,  # Default 7 new customers
-    1,
-    key_prefix="s3",
-    help_text="Average new customers acquired per user monthly (recommended: 5-10)."
-)
-
-# Log the captured new customers per user
-log_message(f"Captured New Customers per User: {new_customers_per_user}", debug_only=True)
 
 initial_search_fee = create_slider_with_range(
     "Initial Search Fee (Tokens)",
@@ -1678,22 +1723,25 @@ initial_search_fee = create_slider_with_range(
     help_text="The initial number of tokens required to perform a search.",
 )
 
-# Log the captured initial search fee
-log_message(f"Captured Initial Search Fee: {initial_search_fee}", debug_only=True)
-
-transaction_fee_rate = create_slider_with_range(
-    "Transaction Fee Rate (%)",
-    0.00,
-    20.00,
-    4.00,  # Default 4%
-    0.01,
-    format="%.2f",
+initial_lookup_frequency = create_slider_with_range(
+    "Initial Lookups per Customer per Year",
+    1,
+    100,
+    9,  # Default 9 lookups
+    1,
     key_prefix="s3",
-    help_text="Fee percentage per transaction (recommended: 3-5%)."
+    help_text="Annual customer lookup frequency (recommended: 6-12)."
 )
 
-# Log the captured transaction fee rate
-log_message(f"Captured Transaction Fee Rate: {transaction_fee_rate}", debug_only=True)
+initial_premium_adoption = create_slider_with_range(
+    "Initial Premium Adoption Rate (% of Users)",
+    0.00,
+    1.00,
+    0.25,  # Default 25%
+    0.01,
+    key_prefix="s3",
+    help_text="Starting premium feature adoption rate (recommended: 20-30%)."
+)
 
 # Add sliders for token purchase parameters
 token_purchase_threshold = create_slider_with_range(
@@ -1706,9 +1754,6 @@ token_purchase_threshold = create_slider_with_range(
     help_text="Token balance triggering purchases (recommended: 5-10)."
 )
 
-# Log the captured token purchase threshold
-log_message(f"Captured Token Purchase Threshold: {token_purchase_threshold}", debug_only=True)
-
 token_purchase_amount = create_slider_with_range(
     "Token Purchase Amount (Tokens)",
     1.0,
@@ -1719,9 +1764,6 @@ token_purchase_amount = create_slider_with_range(
     help_text="Tokens purchased when below threshold (recommended: 10-20)."
 )
 
-# Log the captured token purchase amount
-log_message(f"Captured Token Purchase Amount: {token_purchase_amount}", debug_only=True)
-
 token_sale_price = create_slider_with_range(
     "Token Sale Price ($ per Token)",
     0.01,
@@ -1731,9 +1773,6 @@ token_sale_price = create_slider_with_range(
     key_prefix="s3",
     help_text="The price at which tokens are sold to users."
 )
-
-# Log the captured token sale price
-log_message(f"Captured Token Sale Price: {token_sale_price}", debug_only=True)
 
 # --- Section 4: Market Parameters ---
 st.sidebar.header("4. Market Parameters")
@@ -1823,38 +1862,41 @@ log_message(f"Captured Simulation Duration: {months}", debug_only=True)
 shock_events = None
 
 # --- Run Simulation ---
+log_message(f"Pre-simulation - Growth Rate (after /100): {growth_rate/100.0}", debug_only=True)
 results = simulate_tokenomics(
     initial_reward=initial_reward,
     initial_search_fee=initial_search_fee,
-    growth_rate=growth_rate,
+    growth_rate=growth_rate / 100.0,   # Convert 6.0 => 0.06
     line_items_per_customer=line_items_per_customer,
     initial_lookup_frequency=initial_lookup_frequency,
-    reward_decay_rate=reward_decay_rate,
+    reward_decay_rate=reward_decay_rate / 100.0,  # 1.5 => 0.015
     contribution_cap=contribution_cap,
-    initial_premium_adoption=initial_premium_adoption,
-    inactivity_rate=inactivity_rate,
+    initial_premium_adoption=initial_premium_adoption / 100.0,
+    inactivity_rate=inactivity_rate / 100.0,  # 4.0 => 0.04
     months=months,
-    base_users=base_users,
+    base_users=base_users,  # truly from user input
+    logistic_enabled=False, # If you want no logistic growth
     customers_per_user=customers_per_user,
     new_customers_per_user=new_customers_per_user,
     initial_token_price=initial_token_price,
     price_elasticity=price_elasticity,
-    burn_rate=burn_rate,
+    burn_rate=burn_rate / 100.0,  # 4.0 => 0.04
     initial_market_sentiment=initial_market_sentiment,
     market_volatility=market_volatility,
     market_trend=market_trend,
-    staking_apr=staking_apr,
+    staking_apr=staking_apr / 100.0,
     reward_pool_size=reward_pool_size,
     num_competitors=num_competitors,
     competitor_growth_rates=competitor_growth_rates,
     competitor_attractiveness=competitor_attractiveness,
-    transaction_fee_rate=transaction_fee_rate,
+    transaction_fee_rate=transaction_fee_rate / 100.0,
+    reward_pool_share=reward_pool_share / 100.0,
+    burn_share=burn_share / 100.0,
     token_purchase_threshold=token_purchase_threshold,
     token_purchase_amount=token_purchase_amount,
     token_sale_price=token_sale_price,
     total_users_target=total_users_target,
     total_addressable_market=total_addressable_market,
-    logistic_enabled=True,
     carrying_capacity=total_addressable_market,
     growth_steepness=0.25,
     midpoint_month=12,
@@ -1869,55 +1911,333 @@ results = simulate_tokenomics(
 # --- Main Dashboard ---
 st.markdown("## Platform Performance Dashboard")
 
-# Revenue Section (First and Most Prominent)
-st.markdown("### Revenue Metrics")
-revenue_cols = st.columns(4)
+# --- Revenue Section (First and Most Prominent) ---
+st.markdown("### Token & Fiat Metrics")
 
-with revenue_cols[0]:
-    current_revenue = results['Platform Revenue ($)'].iloc[-1]
-    prev_revenue = results['Platform Revenue ($)'].iloc[-2]
-    revenue_growth = ((current_revenue / prev_revenue) - 1) * 100 if prev_revenue > 0 else 0
+# First row - Token Metrics
+token_cols = st.columns(4)
+
+with token_cols[0]:
+    treasury_balance = results['Treasury Tokens'].iloc[-1]
+    prev_treasury = results['Treasury Tokens'].iloc[-2]
+    treasury_growth = ((treasury_balance / prev_treasury) - 1) * 100 if prev_treasury > 0 else 0
     st.metric(
-        "Current Monthly Revenue",
-        format_currency(current_revenue),
-        f"{revenue_growth:.1f}% MoM",
-        help="Latest monthly platform revenue"
+        "Treasury Balance",
+        f"{format_number(treasury_balance)} tokens",
+        f"{treasury_growth:.1f}% MoM",
+        help="Total tokens in platform treasury"
     )
 
-with revenue_cols[1]:
-    total_revenue = results['Platform Revenue ($)'].sum()
-    avg_monthly_revenue = total_revenue / len(results)
+with token_cols[1]:
+    potential_value = results['Potential Fiat Value ($)'].iloc[-1]
+    prev_value = results['Potential Fiat Value ($)'].iloc[-2]
+    value_growth = ((potential_value / prev_value) - 1) * 100 if prev_value > 0 else 0
+    st.metric(
+        "Potential Treasury Value",
+        format_currency(potential_value),
+        f"{value_growth:.1f}% MoM",
+        help="Current fiat value of treasury tokens (if sold)"
+    )
+
+with token_cols[2]:
+    token_search = results['Token Search Revenue'].iloc[-1]
+    prev_search = results['Token Search Revenue'].iloc[-2]
+    search_growth = ((token_search / prev_search) - 1) * 100 if prev_search > 0 else 0
+    st.metric(
+        "Search Tokens",
+        f"{format_number(token_search)} tokens",
+        f"{search_growth:.1f}% MoM",
+        help="Tokens earned from search fees"
+    )
+
+with token_cols[3]:
+    token_premium = results['Token Premium Revenue'].iloc[-1]
+    prev_premium = results['Token Premium Revenue'].iloc[-2]
+    premium_growth = ((token_premium / prev_premium) - 1) * 100 if prev_premium > 0 else 0
+    st.metric(
+        "Premium Tokens",
+        f"{format_number(token_premium)} tokens",
+        f"{premium_growth:.1f}% MoM",
+        help="Tokens earned from premium features"
+    )
+
+# Second row - Fiat Value Metrics
+st.markdown("#### Monthly Fiat Revenue")
+fiat_cols = st.columns(3)
+
+with fiat_cols[0]:
+    # Current month search revenue
+    search_revenue = token_search * token_sale_price
+    prev_search_revenue = results['Token Search Revenue'].iloc[-2] * token_sale_price
+    search_revenue_growth = ((search_revenue / prev_search_revenue) - 1) * 100 if prev_search_revenue > 0 else 0
+    
+    # Average search revenue
+    avg_search_revenue = np.mean(results['Token Search Revenue'] * token_sale_price)
+    
+    st.metric(
+        "Search Revenue",
+        format_currency(search_revenue),
+        f"{search_revenue_growth:.1f}% MoM",
+        help=f"Monthly revenue from users buying search tokens (Avg: {format_currency(avg_search_revenue)})"
+    )
+
+with fiat_cols[1]:
+    # Current month premium revenue
+    premium_revenue = token_premium * token_sale_price
+    prev_premium_revenue = results['Token Premium Revenue'].iloc[-2] * token_sale_price
+    premium_revenue_growth = ((premium_revenue / prev_premium_revenue) - 1) * 100 if prev_premium_revenue > 0 else 0
+    
+    # Average premium revenue
+    avg_premium_revenue = np.mean(results['Token Premium Revenue'] * token_sale_price)
+    
+    st.metric(
+        "Premium Revenue",
+        format_currency(premium_revenue),
+        f"{premium_revenue_growth:.1f}% MoM",
+        help=f"Monthly revenue from users buying premium tokens (Avg: {format_currency(avg_premium_revenue)})"
+    )
+
+with fiat_cols[2]:
+    # Current month total revenue
+    total_revenue = search_revenue + premium_revenue
+    prev_total_revenue = prev_search_revenue + prev_premium_revenue
+    total_revenue_growth = ((total_revenue / prev_total_revenue) - 1) * 100 if prev_total_revenue > 0 else 0
+    
+    # Average total revenue
+    avg_total_revenue = avg_search_revenue + avg_premium_revenue
+    
     st.metric(
         "Total Revenue",
         format_currency(total_revenue),
-        f"Avg {format_currency(avg_monthly_revenue)}/mo",
-        help="Cumulative platform revenue since launch"
+        f"{total_revenue_growth:.1f}% MoM",
+        help=f"Total monthly revenue from token sales (Avg: {format_currency(avg_total_revenue)})"
+    )
+
+# Revenue Metrics Section
+st.markdown("### Platform Revenue")
+revenue_cols = st.columns(4)
+
+with revenue_cols[0]:
+    # Monthly Recurring Revenue (MRR)
+    current_mrr = search_revenue + premium_revenue
+    prev_mrr = prev_search_revenue + prev_premium_revenue
+    mrr_growth = ((current_mrr / prev_mrr) - 1) * 100 if prev_mrr > 0 else 0
+    
+    st.metric(
+        "Monthly Recurring Revenue",
+        format_currency(current_mrr),
+        f"{mrr_growth:.1f}% MoM",
+        help="Total monthly recurring revenue from all sources"
+    )
+
+with revenue_cols[1]:
+    # Annual Recurring Revenue (ARR)
+    arr = current_mrr * 12
+    prev_arr = prev_mrr * 12
+    arr_growth = ((arr / prev_arr) - 1) * 100 if prev_arr > 0 else 0
+    
+    st.metric(
+        "Annual Run Rate",
+        format_currency(arr),
+        f"{arr_growth:.1f}% YoY",
+        help="Annual revenue run rate based on current MRR"
     )
 
 with revenue_cols[2]:
-    avg_revenue_per_user = current_revenue / results['Users'].iloc[-1]
+    # Revenue Growth Rate (3-month average)
+    last_3_months = results.tail(3)
+    avg_growth_rate = np.mean([
+        ((row['Token Search Revenue'] + row['Token Premium Revenue']) /
+         (results.iloc[i-1]['Token Search Revenue'] + results.iloc[i-1]['Token Premium Revenue']) - 1) * 100
+        for i, row in last_3_months.iterrows()
+        if i > 0
+    ])
+    
     st.metric(
-        "Revenue per User",
-        format_currency(avg_revenue_per_user),
-        help="Average monthly revenue per active user"
+        "Growth Rate (3mo avg)",
+        f"{avg_growth_rate:.1f}%",
+        help="Average monthly revenue growth rate over the last 3 months"
     )
 
 with revenue_cols[3]:
-    premium_revenue = results['Premium Spending'].iloc[-1] * results['Token Price'].iloc[-1]
-    search_revenue = results['Search Spending'].iloc[-1] * results['Token Price'].iloc[-1]
-    total_monthly_revenue = premium_revenue + search_revenue
-    premium_pct = (premium_revenue / total_monthly_revenue * 100) if total_monthly_revenue > 0 else 0
-    search_pct = (search_revenue / total_monthly_revenue * 100) if total_monthly_revenue > 0 else 0
+    # Revenue per User
+    total_users = results['Users'].iloc[-1]
+    revenue_per_user = current_mrr / total_users if total_users > 0 else 0
+    prev_revenue_per_user = prev_mrr / results['Users'].iloc[-2] if results['Users'].iloc[-2] > 0 else 0
+    rpu_growth = ((revenue_per_user / prev_revenue_per_user) - 1) * 100 if prev_revenue_per_user > 0 else 0
+    
     st.metric(
-        "Premium/Search Split",
-        f"{premium_pct:.1f}% / {search_pct:.1f}%",
-        help="Revenue split between premium subscriptions and search fees"
+        "Revenue per User",
+        format_currency(revenue_per_user),
+        f"{rpu_growth:.1f}% MoM",
+        help="Average monthly revenue generated per active user"
     )
 
-# Revenue Trend Chart
-st.markdown("#### Revenue Growth Trend")
-revenue_fig = create_dual_axis_chart(results)
-st.plotly_chart(revenue_fig, use_container_width=True)
+# Growth & Efficiency Metrics
+st.markdown("### Growth & Efficiency Metrics")
+growth_cols = st.columns(4)
+
+with growth_cols[0]:
+    # Customer Acquisition Cost (CAC)
+    # Calculate new users (3-month rolling average)
+    new_users_series = results['Users'].diff().tail(3)
+    avg_new_users = new_users_series[new_users_series > 0].mean()
+    
+    # Calculate marketing spend based on token purchase amount
+    token_purchase_amount = 15.0  # From parameters
+    marketing_percent = 0.20  # Assume 20% of revenue goes to marketing
+    
+    # Calculate average revenue per new user and marketing spend
+    avg_revenue_per_new_user = token_purchase_amount * token_sale_price
+    marketing_spend = avg_revenue_per_new_user * marketing_percent
+    
+    # Calculate CAC (marketing spend per new user)
+    if not pd.isna(avg_new_users) and avg_new_users > 0:
+        cac = marketing_spend
+    else:
+        cac = marketing_spend  # Fallback when no new users
+        
+    # Calculate previous period values
+    prev_new_users = results['Users'].diff().iloc[-2] if len(results) > 1 else avg_new_users
+    prev_cac = marketing_spend  # CAC should be constant if based on fixed token purchase amount
+    cac_change = 0  # No change since CAC is fixed
+    
+    st.metric(
+        "Customer Acquisition Cost",
+        format_currency(cac),
+        f"{cac_change:.1f}% MoM",
+        help="Cost to acquire a new user (Based on 20% of initial token purchase amount)"
+    )
+
+with growth_cols[1]:
+    # Lifetime Value (LTV)
+    avg_lifetime = 12  # Assumed average user lifetime in months
+    ltv = revenue_per_user * avg_lifetime
+    prev_ltv = prev_revenue_per_user * avg_lifetime
+    ltv_change = ((ltv / prev_ltv) - 1) * 100 if prev_ltv > 0 else 0
+    
+    st.metric(
+        "Lifetime Value",
+        format_currency(ltv),
+        f"{ltv_change:.1f}% MoM",
+        help="Projected total revenue from an average user (Assumption: Average user lifetime is 12 months)"
+    )
+
+with growth_cols[2]:
+    # LTV/CAC Ratio
+    if cac and cac > 0:
+        ltv_cac_ratio = ltv / cac
+        if prev_cac and prev_cac > 0:
+            prev_ltv_cac = prev_ltv / prev_cac
+            ratio_change = ((ltv_cac_ratio / prev_ltv_cac) - 1) * 100 if prev_ltv_cac > 0 else 0
+        else:
+            ratio_change = 0
+    else:
+        ltv_cac_ratio = 0
+        ratio_change = 0
+    
+    st.metric(
+        "LTV/CAC Ratio",
+        f"{ltv_cac_ratio:.2f}x" if ltv_cac_ratio > 0 else "N/A",
+        f"{ratio_change:.1f}% MoM" if ratio_change != 0 else None,
+        help="Ratio of lifetime value to acquisition cost (Based on estimated CAC and LTV. Target: >3x for healthy growth)"
+    )
+
+with growth_cols[3]:
+    current_users = results['Users'].iloc[-1]
+    prev_users = results['Users'].iloc[-2] if len(results) > 1 else current_users
+
+    market_penetration = (current_users / total_addressable_market) * 100
+    target_penetration = (total_users_target / total_addressable_market) * 100
+    prev_penetration = (prev_users / total_addressable_market) * 100
+    penetration_change = market_penetration - prev_penetration
+
+    st.metric(
+        "Market Penetration",
+        f"{market_penetration:.1f}%",
+        f"{penetration_change:+.1f}pp",
+        help=f"""
+        Current Market Share: {market_penetration:.1f}% of TAM ({format_number(total_addressable_market)} users)
+        Target: {target_penetration:.1f}% ({format_number(total_users_target)} users)
+        Monthly Growth Rate: {growth_rate:.1f}%
+        """
+    )
+
+    # Add debug logs
+    log_message(f"Current Users: {current_users}", debug_only=True)
+    log_message(f"Previous Users: {prev_users}", debug_only=True)
+    log_message(f"Target Users: {total_users_target}", debug_only=True)
+    log_message(f"TAM: {total_addressable_market}", debug_only=True)
+    log_message(f"Market Penetration: {market_penetration:.2f}%", debug_only=True)
+    log_message(f"Target Penetration: {target_penetration:.2f}%", debug_only=True)
+    log_message(f"Penetration Change: {penetration_change:.2f}pp", debug_only=True)
+
+# Token Economics
+st.markdown("### Token Economics")
+token_cols = st.columns(4)
+
+with token_cols[0]:
+    # Token Velocity
+    monthly_token_volume = results['Monthly Token Spending'].iloc[-1]
+    token_supply = treasury_balance
+    token_velocity = monthly_token_volume / token_supply if token_supply > 0 else 0
+    prev_velocity = (results['Monthly Token Spending'].iloc[-2] / 
+                    results['Treasury Tokens'].iloc[-2]) if results['Treasury Tokens'].iloc[-2] > 0 else 0
+    velocity_change = ((token_velocity / prev_velocity) - 1) * 100 if prev_velocity > 0 else 0
+    
+    st.metric(
+        "Token Velocity",
+        f"{token_velocity:.2f}x",
+        f"{velocity_change:.1f}% MoM",
+        help="Rate at which tokens change hands (Calculated from actual monthly volume / treasury supply)"
+    )
+
+with token_cols[1]:
+    # Staking Ratio
+    staked_tokens = results['Total Tokens Staked'].iloc[-1]
+    staking_ratio = (staked_tokens / token_supply) * 100 if token_supply > 0 else 0
+    prev_staking = (results['Total Tokens Staked'].iloc[-2] / 
+                   results['Treasury Tokens'].iloc[-2]) * 100 if results['Treasury Tokens'].iloc[-2] > 0 else 0
+    staking_change = staking_ratio - prev_staking
+    
+    st.metric(
+        "Staking Ratio",
+        f"{staking_ratio:.1f}%",
+        f"{staking_change:+.1f}pp",
+        help=f"Percentage of treasury tokens currently staked (Target: {staking_apr:.1f}% APR)"
+    )
+
+with token_cols[2]:
+    # Token Holder Growth
+    token_holders = int(total_users * 0.8)  # Assumption: 80% of users hold tokens
+    prev_holders = int(results['Users'].iloc[-2] * 0.8)
+    holder_growth = ((token_holders / prev_holders) - 1) * 100 if prev_holders > 0 else 0
+    
+    st.metric(
+        "Token Holders",
+        format_number(token_holders),
+        f"{holder_growth:.1f}% MoM",
+        help="Estimated number of unique token holders (Assumption: 80% of active users hold tokens)"
+    )
+
+with token_cols[3]:
+    # Token Retention
+    token_retention = ((staked_tokens + monthly_token_volume) / token_supply) * 100 if token_supply > 0 else 0
+    prev_retention = ((results['Total Tokens Staked'].iloc[-2] + results['Monthly Token Spending'].iloc[-2]) / 
+                     results['Treasury Tokens'].iloc[-2]) * 100 if results['Treasury Tokens'].iloc[-2] > 0 else 0
+    retention_change = token_retention - prev_retention
+    
+    st.metric(
+        "Token Retention",
+        f"{token_retention:.1f}%",
+        f"{retention_change:+.1f}pp",
+        help="Percentage of tokens actively used or staked (Calculated from actual staking and spending data)"
+    )
+
+# Platform Treasury & Revenue Chart
+st.markdown("### Platform Treasury & Revenue")
+token_fig = create_dual_axis_chart(results)
+st.plotly_chart(token_fig, use_container_width=True)
 
 st.markdown("---")
 
