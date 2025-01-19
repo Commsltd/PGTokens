@@ -361,11 +361,27 @@ def create_plotly_chart(df, x, y, title, y_label):
     return fig
 
 def create_dual_axis_chart(df):
+    """Create dual axis chart with fresh data"""
+    # Debug logging
+    log_message(f"Creating chart with data shape: {df.shape}", debug_only=True)
+    log_message(f"Available columns: {df.columns.tolist()}", debug_only=True)
+    
+    # Force data refresh
+    df = df.copy()
+    
+    # Rename columns if needed
+    column_mapping = {
+        'Reward Pool': 'treasury_tokens',
+        'Platform Revenue ($)': 'platform_revenue',
+        'Month': 'month'
+    }
+    df = df.rename(columns=column_mapping)
+    
     # Create figure with secondary y-axis
     fig = px.line(
         df, 
-        x="Month", 
-        y="Reward Pool",
+        x="month", 
+        y="treasury_tokens",
         title="Platform Revenue & Treasury Tokens Over Time",
         template="plotly_dark",
         width=800,
@@ -374,57 +390,21 @@ def create_dual_axis_chart(df):
     
     # Add Platform Revenue on secondary y-axis
     fig.add_scatter(
-        x=df["Month"],
-        y=df["Platform Revenue ($)"],
+        x=df["month"],
+        y=df["platform_revenue"],
         name="Platform Revenue",
-        yaxis="y2",
-        line=dict(color="#00CC96", width=2.5)  # Green color for revenue
+        yaxis="y2"
     )
     
-    # Update layout for dual axes
+    # Update layout for better visibility
     fig.update_layout(
-        title=dict(
-            text="Platform Revenue & Treasury Tokens Over Time",
-            x=0.5,
-            y=0.95,
-            font=dict(size=20),
-            xanchor='center',
-            yanchor='top'
-        ),
-        yaxis=dict(
-            title="Treasury Tokens",
-            titlefont=dict(color="#636EFA"),  # Blue color for treasury
-            tickfont=dict(color="#636EFA"),
-            gridcolor='rgba(128,128,128,0.1)',
-            zerolinecolor='rgba(128,128,128,0.1)'
-        ),
-        yaxis2=dict(
-            title="Platform Revenue ($)",
-            titlefont=dict(color="#00CC96"),  # Green color for revenue
-            tickfont=dict(color="#00CC96"),
-            anchor="x",
-            overlaying="y",
-            side="right"
-        ),
-        xaxis=dict(
-            title="Month",
-            gridcolor='rgba(128,128,128,0.1)',
-            zerolinecolor='rgba(128,128,128,0.1)'
-        ),
-        margin=dict(l=60, r=60, t=50, b=60),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(size=14),
-        showlegend=True,
-        legend=dict(
-            yanchor="top",
-            y=0.99,
-            xanchor="left",
-            x=0.01,
-            bgcolor="rgba(0,0,0,0)"
-        ),
-        hovermode='x unified'
+        yaxis=dict(title="Treasury Tokens"),
+        yaxis2=dict(title="Platform Revenue", overlaying="y", side="right"),
+        showlegend=True
     )
+    
+    # Clear any cached data
+    st.cache_data.clear()
     
     return fig
 
@@ -3601,3 +3581,115 @@ with st.expander("🎯 Optimization Panel", expanded=False):
                     st.write(optimization_results['trade_offs'])
             except Exception as e:
                 st.error(f"An error occurred during optimization: {e}")
+
+def get_simulation_inputs():
+    """Get all simulation inputs from the Streamlit UI."""
+    st.sidebar.header("Simulation Parameters")
+    
+    # Basic Parameters
+    st.sidebar.subheader("Basic Parameters")
+    initial_reward = st.sidebar.number_input("Initial Reward", value=100.0, min_value=0.0)
+    initial_search_fee = st.sidebar.number_input("Initial Search Fee", value=0.1, min_value=0.0)
+    growth_rate = st.sidebar.slider("Growth Rate", min_value=0.0, max_value=1.0, value=0.05)
+    line_items_per_customer = st.sidebar.number_input("Line Items per Customer", value=10, min_value=1)
+    initial_lookup_frequency = st.sidebar.number_input("Initial Lookup Frequency", value=5, min_value=1)
+    
+    # Token Economics
+    st.sidebar.subheader("Token Economics")
+    reward_decay_rate = st.sidebar.slider("Reward Decay Rate", min_value=0.0, max_value=1.0, value=0.01)
+    contribution_cap = st.sidebar.number_input("Monthly Token Contribution Cap", value=1000, min_value=0)
+    initial_premium_adoption = st.sidebar.slider("Initial Premium Adoption", min_value=0.0, max_value=1.0, value=0.1)
+    inactivity_rate = st.sidebar.slider("Inactivity Rate", min_value=0.0, max_value=1.0, value=0.05)
+    
+    # Market Parameters
+    st.sidebar.subheader("Market Parameters")
+    months = st.sidebar.number_input("Simulation Months", value=12, min_value=1)
+    base_users = st.sidebar.number_input("Base Users", value=1000, min_value=0)
+    customers_per_user = st.sidebar.number_input("Customers per User", value=5, min_value=0)
+    new_clients_per_user = st.sidebar.number_input("New Clients per User", value=1, min_value=0)
+    
+    # Price Parameters
+    st.sidebar.subheader("Price Parameters")
+    initial_token_price = st.sidebar.number_input("Initial Token Price", value=1.0, min_value=0.0)
+    price_elasticity = st.sidebar.slider("Price Elasticity", min_value=0.0, max_value=2.0, value=1.0)
+    burn_rate = st.sidebar.slider("Burn Rate", min_value=0.0, max_value=1.0, value=0.01)
+    
+    # Market Sentiment
+    st.sidebar.subheader("Market Sentiment")
+    initial_market_sentiment = st.sidebar.slider("Initial Market Sentiment", min_value=0.0, max_value=2.0, value=1.0)
+    market_volatility = st.sidebar.slider("Market Volatility", min_value=0.0, max_value=1.0, value=0.1)
+    market_trend = st.sidebar.slider("Market Trend", min_value=-1.0, max_value=1.0, value=0.0)
+    
+    # Staking and Rewards
+    st.sidebar.subheader("Staking and Rewards")
+    staking_apr = st.sidebar.slider("Staking APR", min_value=0.0, max_value=0.5, value=0.1)
+    reward_pool_size = st.sidebar.number_input("Reward Pool Size", value=10000, min_value=0)
+    
+    # Competition
+    st.sidebar.subheader("Competition")
+    num_competitors = st.sidebar.number_input("Number of Competitors", value=5, min_value=0)
+    base_growth_rate = st.sidebar.slider("Competitor Growth Rate", min_value=0.0, max_value=1.0, value=0.05)
+    base_attractiveness = st.sidebar.slider("Competitor Attractiveness", min_value=0.0, max_value=1.0, value=0.5)
+    # Convert single values to lists
+    competitor_growth_rates = [base_growth_rate] * num_competitors
+    competitor_attractiveness = [base_attractiveness] * num_competitors
+    
+    # Token Purchase Parameters
+    st.sidebar.subheader("Token Purchase Parameters")
+    token_purchase_threshold = st.sidebar.number_input("Token Purchase Threshold", value=10, min_value=0)
+    token_purchase_amount = st.sidebar.number_input("Token Purchase Amount", value=100, min_value=0)
+    token_sale_price = st.sidebar.number_input("Token Sale Price", value=1.0, min_value=0.0)
+    
+    # Growth Parameters
+    st.sidebar.subheader("Growth Parameters")
+    total_users_target = st.sidebar.number_input("Total Users Target", value=10000, min_value=1)
+    total_addressable_market = st.sidebar.number_input("Total Addressable Market", value=100000, min_value=1)
+    logistic_enabled = st.sidebar.checkbox("Enable Logistic Growth", value=False)
+    carrying_capacity = total_addressable_market  # Set carrying capacity to match TAM
+    growth_steepness = st.sidebar.slider("Growth Steepness", min_value=0.0, max_value=1.0, value=0.3)
+    midpoint_month = st.sidebar.number_input("Midpoint Month", value=12, min_value=1)
+    
+    # Vesting Parameters
+    st.sidebar.subheader("Vesting Parameters")
+    total_vested_tokens = st.sidebar.number_input("Total Vested Tokens", value=0, min_value=0)
+    vest_duration = st.sidebar.number_input("Vest Duration (months)", value=0, min_value=0)
+    
+    return (
+        initial_reward, initial_search_fee, growth_rate, line_items_per_customer,
+        initial_lookup_frequency, reward_decay_rate, contribution_cap,
+        initial_premium_adoption, inactivity_rate, months, base_users,
+        customers_per_user, new_clients_per_user, initial_token_price,
+        price_elasticity, burn_rate, initial_market_sentiment, market_volatility,
+        market_trend, staking_apr, reward_pool_size, num_competitors,
+        competitor_growth_rates, competitor_attractiveness, token_purchase_threshold,
+        token_purchase_amount, token_sale_price, total_users_target,
+        total_addressable_market, logistic_enabled, carrying_capacity,
+        growth_steepness, midpoint_month, total_vested_tokens, vest_duration,
+        None  # shock_events parameter
+    )
+
+def main():
+    """Main function to run simulation and create visualization"""
+    try:
+        # Get simulation inputs
+        simulation_params = get_simulation_inputs()
+        
+        # Run simulation with fresh parameters
+        results = simulate_tokenomics(*simulation_params)
+        
+        # Debug logging for results
+        log_message(f"Simulation results shape: {results.shape}", debug_only=True)
+        log_message(f"Columns: {results.columns.tolist()}", debug_only=True)
+        log_message(f"Treasury stats: min={results['treasury_tokens'].min():.2f}, max={results['treasury_tokens'].max():.2f}", debug_only=True)
+        
+        # Create chart with fresh data
+        chart = create_dual_axis_chart(results)
+        
+        # Display chart
+        st.plotly_chart(chart, use_container_width=True)
+        
+        return results
+        
+    except Exception as e:
+        log_message(f"Error in main: {str(e)}", debug_only=False)
+        raise
